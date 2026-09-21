@@ -1,0 +1,96 @@
+name: Overlayfsx CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: RipperHybrid/sbx
+  TARGET_BRANCH: Exfsx
+  LOG: /tmp/build.log
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.GHTOKEN }}
+          fetch-depth: 0
+          path: src
+
+      - name: Start timer
+        run: date +%s > /tmp/build_start_ts
+
+      - name: Metadata
+        id: metadata
+        working-directory: src
+        run: |
+          PROP_FILE=$(find . -type f -name "module.prop" ! -path "*/target/*" | head -n 1)
+          [ -z "$PROP_FILE" ] && { echo "module.prop not found"; exit 1; }
+          python3 ../release.py metadata --module-prop "$PROP_FILE" --prefix Meta-Overlayfsx
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        working-directory: src
+        run: |
+          {
+            rustup update stable
+            rustup target add aarch64-linux-android
+            rustup target add x86_64-linux-android
+          } 2>&1 | tee -a "$LOG"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          cache-targets: false
+
+      - name: Install cross
+        working-directory: src
+        run: cargo install cross --git https://github.com/cross-rs/cross 2>&1 | tee -a "$LOG"
+
+      - name: Build
+        working-directory: src
+        run: |
+          chmod +x build.sh
+          ./build.sh 2>&1 | tee -a "$LOG"
+
+      - name: Create Zip
+        working-directory: src
+        run: |
+          cd target/module
+          zip -r "../../../${{ steps.metadata.outputs.filename }}" . 2>&1 | tee -a "$LOG"
+
+      - name: Publish
+        if: always()
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TEST_BUILDS }}
+        run: |
+          python3 ../release.py publish \
+            --source-repo "${{ env.SOURCE_REPO }}" \
+            --branch "${{ env.TARGET_BRANCH }}" \
+            --name "Overlayfsx" \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --status "${{ job.status }}" \
+            --zip "../${{ steps.metadata.outputs.filename }}" \
+            --log "$LOG" \
+            --start-ts-file /tmp/build_start_ts

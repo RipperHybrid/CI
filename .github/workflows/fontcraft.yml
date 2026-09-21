@@ -1,0 +1,94 @@
+name: FontCraft CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: RipperHybrid/sbx
+  TARGET_BRANCH: ExCraft
+  LOG: /tmp/build.log
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.GHTOKEN }}
+          fetch-depth: 0
+          path: src
+
+      - name: Start timer
+        run: date +%s > /tmp/build_start_ts
+
+      - name: Metadata
+        id: metadata
+        working-directory: src
+        run: python3 ../release.py metadata --module-prop module.prop --prefix FontCraft
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build
+        working-directory: src
+        run: |
+          {
+            if [ -f "webroot/package.json" ]; then
+              cd webroot
+              npm install
+              npm run build
+              [ -d "cgi-bin" ] && cp -r cgi-bin dist/
+              cd ..
+            fi
+
+            mkdir -p Template_Build
+            cp -r binaries META-INF action.sh module.prop monitor.sh service.sh utils.sh uninstall.sh Template_Build/
+            if [ -d "webroot/dist" ]; then cp -r webroot/dist Template_Build/webroot
+            elif [ -d "webroot" ]; then cp -r webroot Template_Build/; fi
+            (cd Template_Build && zip -r ../template.zip .)
+            mkdir -p Template
+            mv template.zip Template/
+
+            mkdir -p Master_Staging
+            cp -r binaries META-INF Template action.sh customize.sh utils.sh monitor.sh module.prop service.sh uninstall.sh Master_Staging/
+            if [ -d "webroot/dist" ]; then cp -r webroot/dist Master_Staging/webroot
+            elif [ -d "webroot" ]; then cp -r webroot Master_Staging/; fi
+          } 2>&1 | tee -a "$LOG"
+
+      - name: Create Zip
+        working-directory: src
+        run: |
+          cd Master_Staging
+          zip -r "../../${{ steps.metadata.outputs.filename }}" . 2>&1 | tee -a "$LOG"
+
+      - name: Publish
+        if: always()
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TEST_BUILDS }}
+        run: |
+          python3 ../release.py publish \
+            --source-repo "${{ env.SOURCE_REPO }}" \
+            --branch "${{ env.TARGET_BRANCH }}" \
+            --name "FontCraft" \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --status "${{ job.status }}" \
+            --zip "../${{ steps.metadata.outputs.filename }}" \
+            --log "$LOG" \
+            --start-ts-file /tmp/build_start_ts

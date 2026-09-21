@@ -1,0 +1,45 @@
+name: Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build run to wait for
+        required: false
+        default: ''
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const self = context.runId;
+            const target = Number(context.payload.inputs?.run_id);
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+            if (target) {
+              for (let i = 0; i < 60; i++) {
+                const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: target });
+                if (data.status === 'completed') break;
+                await sleep(5000);
+              }
+            }
+
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              { owner, repo, per_page: 100 }
+            );
+            for (const run of runs) {
+              if (run.id === self || run.status !== 'completed') continue;
+              try {
+                await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
+              } catch (e) {}
+            }

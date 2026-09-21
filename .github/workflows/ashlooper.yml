@@ -1,0 +1,76 @@
+name: AshLooper CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: RipperHybrid/sbx
+  TARGET_BRANCH: ExLooper
+  LOG: /tmp/build.log
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.GHTOKEN }}
+          fetch-depth: 0
+          path: src
+
+      - name: Start timer
+        run: date +%s > /tmp/build_start_ts
+
+      - name: Metadata
+        id: metadata
+        working-directory: src
+        run: python3 ../release.py metadata --module-prop module.prop --prefix AshLooper
+
+      - name: Run Vite
+        working-directory: src
+        run: |
+          {
+            if [ -f "package.json" ]; then
+              if grep -q '"vite"' package.json || ls vite.config.* 1> /dev/null 2>&1; then
+                npm install
+                npx vite build
+              fi
+            fi
+          } 2>&1 | tee -a "$LOG"
+
+      - name: Create Zip
+        working-directory: src
+        run: |
+          zip -r "../${{ steps.metadata.outputs.filename }}" \
+          jq META-INF webroot action.sh customize.sh utils.sh monitor.sh \
+          module.prop post-fs-data.sh service.sh settings.prop uninstall.sh 2>&1 | tee -a "$LOG"
+
+      - name: Publish
+        if: always()
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TEST_BUILDS }}
+        run: |
+          python3 ../release.py publish \
+            --source-repo "${{ env.SOURCE_REPO }}" \
+            --branch "${{ env.TARGET_BRANCH }}" \
+            --name "AshReXcue" \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --status "${{ job.status }}" \
+            --zip "../${{ steps.metadata.outputs.filename }}" \
+            --log "$LOG" \
+            --start-ts-file /tmp/build_start_ts
