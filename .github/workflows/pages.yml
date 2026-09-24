@@ -1,0 +1,87 @@
+name: Deploy Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Cloudflare Pages project
+        required: true
+        default: ashrexcue
+      repo:
+        description: GitHub repo (owner/name)
+        required: true
+        default: RipperHybrid/Websites
+      branch:
+        description: Git branch
+        required: true
+        default: ashrexcue
+      cf_branch:
+        description: Cloudflare production branch
+        required: true
+        default: main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.GHTOKEN }}
+
+      - name: Prepare
+        run: |
+          mkdir -p ./_deploy
+          rsync -av --exclude='README.md' \
+                     --exclude='.git' \
+                     --exclude='.github' \
+                     --exclude='_deploy' \
+                     ./ ./_deploy/
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ID }}
+          command: pages deploy ./_deploy --project-name=${{ inputs.project }} --branch=${{ inputs.cf_branch }}
+
+      - name: Cleanup old deployments
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ID }}
+        run: |
+          PROJECT="${{ inputs.project }}"
+          KEEP=2
+          echo "Starting cleanup for $PROJECT (keeping latest $KEEP)"
+          RESPONSE=$(curl -s -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/pages/projects/$PROJECT/deployments")
+          TOTAL=$(echo "$RESPONSE" | jq -r '.result_info.total_count')
+          echo "Total deployments: $TOTAL"
+          if [ "$TOTAL" -le "$KEEP" ]; then
+            echo "Nothing to clean up."
+            exit 0
+          fi
+          PROD_ID=$(echo "$RESPONSE" | jq -r '.result[] | select(.environment=="production") | .id' | head -n 1)
+          echo "Production deployment: $PROD_ID"
+          mapfile -t TO_DELETE < <(echo "$RESPONSE" | jq -r '.result | sort_by(.created_on) | reverse | .['"$KEEP"':] | .[] | select(.environment!="production") | .id')
+          if [ ${#TO_DELETE[@]} -eq 0 ]; then
+            echo "Nothing to delete."
+            exit 0
+          fi
+          echo "Deployments to remove: ${#TO_DELETE[@]}"
+          for ID in "${TO_DELETE[@]}"; do
+            if [ "$ID" = "$PROD_ID" ]; then
+              echo "Skipping $ID (production)"
+              continue
+            fi
+            echo "Deleting $ID"
+            RESULT=$(curl -s -X DELETE -H "Authorization: Bearer $CF_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/pages/projects/$PROJECT/deployments/$ID" | jq -r '.success')
+            [ "$RESULT" = "true" ] && echo "Deleted." || echo "Failed."
+          done
+          echo "Cleanup complete."

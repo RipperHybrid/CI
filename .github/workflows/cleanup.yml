@@ -3,10 +3,22 @@ name: Cleanup
 on:
   workflow_dispatch:
     inputs:
+      repo:
+        description: 'Repo'
+        required: false
+        default: 'RipperHybrid/CI'
       run_id:
-        description: Build run to wait for
+        description: 'Run ID'
         required: false
         default: ''
+      branch:
+        description: 'Branch'
+        required: false
+        default: 'Master'
+      keep:
+        description: 'Runs to keep'
+        required: false
+        default: '2'
 
 permissions:
   actions: write
@@ -16,30 +28,111 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Purge
+      - name: Purge old workflow runs
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GHTOKEN }}
           script: |
-            const { owner, repo } = context.repo;
+            const inputs = context.payload.inputs || {};
+            const branch = (inputs.branch || '').trim();
+            const keep = Math.max(0, parseInt(inputs.keep, 10) || 0);
             const self = context.runId;
-            const target = Number(context.payload.inputs?.run_id);
+
+            try {
+              const me = await github.rest.users.getAuthenticated();
+              core.info(`Authenticated as: ${me.data.login} (${me.data.type})`);
+            } catch (e) {
+              core.setFailed(`GHTOKEN secret is missing or invalid: ${e.message}`);
+              return;
+            }
+
+            let target = (inputs.repo || '').trim()
+              .replace(/^https?:\/\/github\.com\//i, '')
+              .replace(/\.git$/i, '')
+              .replace(/^\/+|\/+$/g, '');
+            let owner, repo;
+            if (target && target.includes('/')) {
+              [owner, repo] = target.split('/').slice(0, 2);
+            } else {
+              ({ owner, repo } = context.repo);
+            }
+            target = `${owner}/${repo}`;
+            const isSelfRepo = owner === context.repo.owner && repo === context.repo.repo;
+
             const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-            if (target) {
-              for (let i = 0; i < 60; i++) {
-                const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: target });
-                if (data.status === 'completed') break;
-                await sleep(5000);
+            let runId = Number(inputs.run_id);
+            if (!runId) {
+              const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                owner, repo, per_page: 10
+              });
+              const latest = data.workflow_runs.find(r => !(isSelfRepo && r.id === self));
+              runId = latest?.id || 0;
+              if (runId && latest.status !== 'completed') {
+                core.info(`No run_id given — waiting for latest run "${latest.name}" #${latest.run_number} (${runId}) to finish.`);
               }
             }
 
+            if (runId) {
+              let concluded = null;
+              for (let i = 0; i < 60; i++) {
+                const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+                if (data.status === 'completed') { concluded = data; break; }
+                if (i === 0) core.info(`Run ${runId} is still running — waiting (checks every 5s, max 5 min)...`);
+                await sleep(5000);
+              }
+              if (concluded) {
+                core.info(`Run ${runId} concluded: ${concluded.conclusion} — proceeding with purge.`);
+              } else {
+                core.warning(`Run ${runId} still running after 5 min — purging anyway (running run is skipped automatically).`);
+              }
+            }
+
+            const listParams = { owner, repo, per_page: 100 };
+            if (branch) listParams.branch = branch;
+
             const runs = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
-              { owner, repo, per_page: 100 }
+              listParams
             );
+
+            const byWorkflow = new Map();
             for (const run of runs) {
-              if (run.id === self || run.status !== 'completed') continue;
-              try {
-                await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
-              } catch (e) {}
+              if (isSelfRepo && run.id === self) continue;
+              if (run.status !== 'completed') continue;
+              if (!byWorkflow.has(run.workflow_id)) byWorkflow.set(run.workflow_id, []);
+              byWorkflow.get(run.workflow_id).push(run);
             }
+
+            let deleted = 0;
+            const lines = [];
+            for (const [workflowId, group] of byWorkflow) {
+              group.sort((a, b) =>
+                b.created_at.localeCompare(a.created_at) || b.run_number - a.run_number
+              );
+              const name = group[0].name || `workflow ${workflowId}`;
+              lines.push(`### ${name} — keeping ${Math.min(keep, group.length)} of ${group.length}`);
+              for (let i = 0; i < group.length; i++) {
+                const run = group[i];
+                if (i < keep) {
+                  lines.push(`- ✅ kept #${run.run_number} (${run.created_at})`);
+                  continue;
+                }
+                try {
+                  await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
+                  deleted++;
+                  lines.push(`- 🗑️ deleted #${run.run_number} (${run.created_at})`);
+                } catch (e) {
+                  lines.push(`- ⚠️ failed to delete #${run.run_number}: ${e.message}`);
+                }
+              }
+            }
+
+            if (byWorkflow.size === 0) lines.push('No completed runs found to clean.');
+
+            await core.summary
+              .addHeading(`Workflow run cleanup — ${target}`)
+              .addRaw(`Branch filter: ${branch || 'all'} • Keep per workflow: ${keep} • Deleted: ${deleted}`)
+              .addSeparator()
+              .addRaw(lines.join('\n'))
+              .write();

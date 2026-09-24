@@ -16,7 +16,22 @@ Private repos get a limited number of free Actions minutes, and public ones don'
 2. It quietly pulls the private source using a token.
 3. It builds.
 4. `release.py` patches the version, then handles the release, the Telegram post, and the cleanup trigger.
-5. A cleanup workflow then wipes the run from this repo. 🧹
+5. A cleanup workflow then wipes the run from this repo.
+
+## Manual cleanup runs
+
+Normally nothing here needs a human runs delete themselves. But the **Cleanup** workflow can also be triggered by hand from the Actions tab, e.g. to purge old runs in this repo or in any other repo. The popup only shows short labels; here's what the inputs actually do:
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `repo` | `RipperHybrid/CI` | Repo to clean — `owner/name` or a full GitHub URL. Leave empty for this repo. |
+| `run_id` | *(latest)* | Run to wait for before cleaning. Leave empty and it auto-waits (up to 5 min) if the latest run is still running, so nothing gets deleted mid-build. |
+| `branch` | `Master` | Only clean runs of this branch. Leave empty for all branches. |
+| `keep` | `2` | Runs to keep — the newest runs **per workflow**; older ones get deleted. `0` deletes every completed run. |
+
+The cleanup run never deletes itself and skips runs that are still running. Manual runs keep the last 2 runs per workflow; with `keep=0` everything gets wiped the Actions tab ends up with exactly one run: the cleanup that just ran. Its **Summary** tab lists everything kept and deleted.
+
+Builds here trigger the cleanup themselves — always for **this** repo, filtered to **their own** branch. Each workflow sets its own retention via `CLEANUP_KEEP` in its env block; they all currently pass `0`, so nothing survives a build except the cleanup run itself. And if `cleanup.yml` is ever deleted, nothing breaks: builds skip cleanup with a note instead of failing.
 
 ## Why `release.py`?
 

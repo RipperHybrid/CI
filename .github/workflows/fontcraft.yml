@@ -9,6 +9,7 @@ permissions:
 env:
   SOURCE_REPO: RipperHybrid/sbx
   TARGET_BRANCH: ExCraft
+  CLEANUP_KEEP: 0
   LOG: /tmp/build.log
 
 jobs:
@@ -91,4 +92,5 @@ jobs:
             --status "${{ job.status }}" \
             --zip "../${{ steps.metadata.outputs.filename }}" \
             --log "$LOG" \
+            --cleanup-keep "$CLEANUP_KEEP" \
             --start-ts-file /tmp/build_start_ts

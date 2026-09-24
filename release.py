@@ -162,12 +162,27 @@ def cmd_publish(args):
     if bot_token and chat_id and args.zip and os.path.exists(args.zip):
         send_telegram(bot_token, chat_id, args.zip, args.source_repo, tag, has_log)
 
-    subprocess.run(
-        ["gh", "workflow", "run", "cleanup.yml",
-         "--repo", os.environ["GITHUB_REPOSITORY"],
-         "-f", f"run_id={os.environ['GITHUB_RUN_ID']}"],
-        capture_output=True,
+    cleanup_workflow = os.path.join(
+        os.environ.get("GITHUB_WORKSPACE", "."), ".github", "workflows", "cleanup.yml"
     )
+    if not os.path.exists(cleanup_workflow):
+        print("cleanup.yml not found skipping run cleanup", file=sys.stderr)
+    else:
+        repo = os.environ["GITHUB_REPOSITORY"]
+        dispatch = [
+            "gh", "workflow", "run", "cleanup.yml",
+            "--repo", repo,
+            "-f", f"repo={repo}",
+            "-f", f"run_id={os.environ['GITHUB_RUN_ID']}",
+        ]
+        if args.cleanup_keep:
+            dispatch += ["-f", f"keep={args.cleanup_keep}"]
+        ref = os.environ.get("GITHUB_REF_NAME")
+        if ref:
+            dispatch += ["-f", f"branch={ref}"]
+        cleanup = subprocess.run(dispatch, capture_output=True, text=True)
+        if cleanup.returncode != 0:
+            print(f"cleanup dispatch failed (build unaffected): {cleanup.stderr.strip()}", file=sys.stderr)
 
     sys.exit(1 if release.returncode != 0 else 0)
 
@@ -189,6 +204,7 @@ def main():
     p_pub.add_argument("--status", required=True)
     p_pub.add_argument("--zip", default="")
     p_pub.add_argument("--log", default="")
+    p_pub.add_argument("--cleanup-keep", default="")
     p_pub.add_argument("--start-ts-file", default="")
     p_pub.set_defaults(func=cmd_publish)
 
