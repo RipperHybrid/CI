@@ -55,7 +55,7 @@ jobs:
         working-directory: src
         run: |
           zip -r "../${{ steps.metadata.outputs.filename }}" \
-          jq META-INF webroot action.sh customize.sh utils.sh monitor.sh \
+          bin META-INF webroot action.sh customize.sh utils.sh monitor.sh \
           module.prop post-fs-data.sh service.sh settings.prop uninstall.sh 2>&1 | tee -a "$LOG"
 
       - name: Publish
