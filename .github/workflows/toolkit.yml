@@ -1,0 +1,650 @@
+name: Toolkit Static Builder
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 1 * *'
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SOURCE_REPO: RipperHybrid/ToolKit
+  TARGET_BRANCH: Master
+  CLEANUP_KEEP: 0
+
+jobs:
+  build-android-binaries:
+    runs-on: ubuntu-latest
+
+    env:
+      WEAPONDIR: ${{ github.workspace }}/weaponx
+      INOTIFYDIR: ${{ github.workspace }}/inotify-tools
+      JQDIR: ${{ github.workspace }}/jq
+      ZIPDIR: ${{ github.workspace }}/zip30
+
+    steps:
+    - name: Checkout runner
+      uses: actions/checkout@v4
+
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.SOURCE_REPO }}
+        ref: ${{ env.TARGET_BRANCH }}
+        token: ${{ secrets.GHTOKEN }}
+        fetch-depth: 0
+        path: src
+
+    - name: Set environment variables & get versions
+      run: |
+        date +%s > /tmp/build_start_ts
+        echo "BUILD_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+        echo "BUILD_TIME=$(TZ='Asia/Kolkata' date +'%I:%M:%S %p IST')" >> $GITHUB_ENV
+        echo "BUILD_TAG=$(date +'%Y%m%d')" >> $GITHUB_ENV
+        : > /tmp/toolkit_build.log
+
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "TRIGGER_TYPE=Manual" >> $GITHUB_ENV
+        elif [ "${{ github.event_name }}" = "schedule" ]; then
+          echo "TRIGGER_TYPE=Auto (Scheduled)" >> $GITHUB_ENV
+        else
+          echo "TRIGGER_TYPE=Auto (Push)" >> $GITHUB_ENV
+        fi
+
+        sudo apt-get update
+        sudo apt-get install -y curl python3-pip
+        pip3 install meson ninja
+
+        LATEST_BASH=$(curl -s https://ftp.gnu.org/gnu/bash/ | grep -oP 'bash-\K[0-9]+\.[0-9]+(?=\.tar\.gz)' | sort -V | tail -1)
+        echo "LATEST_VERSION=$LATEST_BASH" >> $GITHUB_ENV
+
+    - name: Install Build Tools, Cross-Compilers & Rust
+      run: |
+        sudo apt-get install -y build-essential wget tar xz-utils curl
+        sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user-static
+        sudo apt-get install -y autoconf automake libtool
+        sudo apt-get install -y python3
+
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+        source "$HOME/.cargo/env"
+        rustup target add aarch64-unknown-linux-gnu
+
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Setup Zig Compiler
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.13.0
+        cache: false
+
+    - name: Configure & Compile inotify-tools
+      run: |
+        echo "INOTIFY_ATTEMPTED=true" >> $GITHUB_ENV
+        exec > >(tee -a /tmp/toolkit_build.log) 2>&1
+        source "$HOME/.cargo/env"
+
+        git clone https://github.com/inotify-tools/inotify-tools.git "$INOTIFYDIR"
+        cd "$INOTIFYDIR"
+
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
+
+        make TARGET=aarch64-unknown-linux-gnu ALL_STATIC=1
+
+        INOTIFY_OUT="$INOTIFYDIR/target/static/aarch64-unknown-linux-gnu/release"
+
+        aarch64-linux-gnu-strip --strip-all \
+          "$INOTIFY_OUT/inotifywait" \
+          "$INOTIFY_OUT/inotifywatch"
+
+        qemu-aarch64-static "$INOTIFY_OUT/inotifywait" -h > /dev/null || true
+
+        T=$SECONDS; echo "INOTIFY_BUILD_TIME=$((T/60))m $((T%60))s" >> $GITHUB_ENV
+        echo "INOTIFY_BIN_DIR=$INOTIFY_OUT" >> $GITHUB_ENV
+        echo "INOTIFYWAIT_OK=true" >> $GITHUB_ENV
+        echo "INOTIFYWATCH_OK=true" >> $GITHUB_ENV
+
+    - name: Download bash source
+      run: |
+        echo "BASH_ATTEMPTED=true" >> $GITHUB_ENV
+        exec > >(tee -a /tmp/toolkit_build.log) 2>&1
+        SOURCE_FILE="bash-${{ env.LATEST_VERSION }}.tar.gz"
+        for mirror in \
+          "https://ftp.gnu.org/gnu/bash/$SOURCE_FILE" \
+          "https://ftpmirror.gnu.org/bash/$SOURCE_FILE" \
+          "https://mirrors.kernel.org/gnu/bash/$SOURCE_FILE"
+        do
+          if wget --tries=3 --timeout=20 --waitretry=3 "$mirror" -O "$SOURCE_FILE"; then
+            break
+          else
+            rm -f "$SOURCE_FILE"
+          fi
+        done
+
+        if [ ! -f "$SOURCE_FILE" ]; then exit 1; fi
+        tar -xzf "$SOURCE_FILE"
+        mv "bash-${{ env.LATEST_VERSION }}" "weaponx"
+
+    - name: Configure & Compile GNU Bash
+      run: |
+        exec > >(tee -a /tmp/toolkit_build.log) 2>&1
+        cd "$WEAPONDIR"
+        export CC=aarch64-linux-gnu-gcc
+        export STRIP=aarch64-linux-gnu-strip
+
+        ./configure --host=aarch64-linux-gnu \
+          --enable-static-link --with-bash-malloc --enable-alias \
+          --enable-alt-array-implementation --enable-arith-for-command \
+          --enable-array-variables --enable-bang-history \
+          --enable-bash-source-fullpath-default --enable-brace-expansion \
+          --enable-casemod-attributes --enable-casemod-expansions \
+          --enable-command-timing --enable-cond-command \
+          --enable-cond-regexp --enable-coprocesses \
+          --enable-debugger --enable-direxpand-default \
+          --enable-directory-stack --enable-disabled-builtins \
+          --enable-dparen-arithmetic --enable-extended-glob \
+          --enable-extended-glob-default --enable-function-import \
+          --enable-glob-asciiranges-default --enable-help-builtin \
+          --enable-history --enable-job-control --enable-mem-scramble \
+          --enable-multibyte --enable-net-redirections \
+          --enable-process-substitution --enable-progcomp \
+          --enable-prompt-string-decoding --enable-readline \
+          --enable-restricted --enable-select \
+          --enable-single-help-strings --enable-translatable-strings \
+          --enable-usg-echo-default --enable-year2038 \
+          --disable-largefile --disable-nls --disable-rpath --without-curses
+
+        make -j$(nproc) LDFLAGS="-static -s -Wl,--build-id=none" CFLAGS="-O2 -static -fPIE -fno-ident -fno-stack-protector -U_FORTIFY_SOURCE"
+        aarch64-linux-gnu-strip --strip-all --remove-section=.comment --remove-section=.note bash
+        mv bash weaponx
+        qemu-aarch64-static ./weaponx --version
+        echo "WEAPONX_OK=true" >> $GITHUB_ENV
+
+        T=$SECONDS; echo "BASH_BUILD_TIME=$((T/60))m $((T%60))s" >> $GITHUB_ENV
+
+    - name: Configure & Compile jq
+      run: |
+        echo "JQ_ATTEMPTED=true" >> $GITHUB_ENV
+        exec > >(tee -a /tmp/toolkit_build.log) 2>&1
+        git clone https://github.com/jqlang/jq.git "$JQDIR"
+        cd "$JQDIR"
+        git submodule update --init
+        autoreconf -i
+        export CC=aarch64-linux-gnu-gcc
+        ./configure --host=aarch64-linux-gnu --with-oniguruma=builtin --disable-shared --enable-static
+        make LDFLAGS="-all-static" -j$(nproc)
+        aarch64-linux-gnu-strip --strip-all jq
+        qemu-aarch64-static ./jq --version
+        echo "JQ_OK=true" >> $GITHUB_ENV
+
+        T=$SECONDS; echo "JQ_BUILD_TIME=$((T/60))m $((T%60))s" >> $GITHUB_ENV
+
+    - name: Configure & Compile zip
+      run: |
+        echo "ZIP_ATTEMPTED=true" >> $GITHUB_ENV
+        exec > >(tee -a /tmp/toolkit_build.log) 2>&1
+        wget https://downloads.sourceforge.net/infozip/zip30.tar.gz
+        tar -xzf zip30.tar.gz
+        cd "$ZIPDIR"
+
+        sed -i '726,728d' zip.h
+        sed -i '1i#undef ZMEM' fileio.c
+        sed -i '1i#include <time.h>' timezone.c
+        sed -i '1i#undef NO_DIR' unix/unix.c
+        sed -i '1i#define HAVE_DIRENT_H' unix/unix.c
+        sed -i '1i#undef NO_MKTIME' util.c
+
+        sed -i 's/-DNO_MKTIME//g' unix/Makefile
+        sed -i 's/$(BIND) -o zip/$(BIND) -static -o zip/g' unix/Makefile
+
+        sed -i 's/CC=gcc/CC=aarch64-linux-gnu-gcc/g' unix/Makefile
+        sed -i 's/CPP="gcc -E"/CPP="aarch64-linux-gnu-gcc -E"/g' unix/Makefile
+        sed -i 's/AS="gcc -c"/AS="aarch64-linux-gnu-gcc -c"/g' unix/Makefile
+
+        make -f unix/Makefile generic CC="aarch64-linux-gnu-gcc" CFLAGS="-O2 -static -D_FILE_OFFSET_BITS=64 -DUNIX" LDFLAGS="-static"
+
+        aarch64-linux-gnu-strip --strip-all zip
+        qemu-aarch64-static ./zip -h > /dev/null || true
+        echo "ZIP_OK=true" >> $GITHUB_ENV
+
+        T=$SECONDS; echo "ZIP_BUILD_TIME=$((T/60))m $((T%60))s" >> $GITHUB_ENV
+
+    - name: Configure & Compile ABX Tools
+      working-directory: src
+      run: |
+        echo "ABX_ATTEMPTED=true" >> $GITHUB_ENV
+        exec > >(tee -a /tmp/toolkit_build.log) 2>&1
+        cat > aarch64-cross.txt << 'EOF'
+        [binaries]
+        c = 'aarch64-linux-gnu-gcc'
+        cpp = 'aarch64-linux-gnu-g++'
+        ar = 'aarch64-linux-gnu-gcc-ar'
+        strip = 'aarch64-linux-gnu-strip'
+
+        [built-in options]
+        c_args = ['-O3', '-flto']
+        cpp_args = ['-O3', '-flto']
+        c_link_args = ['-static', '-flto', '-Wl,--gc-sections', '-Wl,--strip-all']
+        cpp_link_args = ['-static', '-flto', '-Wl,--gc-sections', '-Wl,--strip-all']
+
+        [host_machine]
+        system = 'linux'
+        cpu_family = 'aarch64'
+        cpu = 'aarch64'
+        endian = 'little'
+        EOF
+
+        meson setup build_abx --cross-file aarch64-cross.txt -Ddefault_library=static
+        meson compile -C build_abx
+
+        qemu-aarch64-static ./build_abx/abx -h > /dev/null || true
+        echo "ABX_OK=true" >> $GITHUB_ENV
+
+        T=$SECONDS; echo "ABX_BUILD_TIME=$((T/60))m $((T%60))s" >> $GITHUB_ENV
+
+    - name: Verify Binaries & Capture Usage
+      run: |
+        exec > >(tee -a /tmp/toolkit_build.log) 2>&1
+        human_size() {
+          local bytes=$1
+          if [ "$bytes" -ge 1048576 ]; then
+            awk "BEGIN {printf \"%.2f MB\", $bytes/1048576}"
+          elif [ "$bytes" -ge 1024 ]; then
+            awk "BEGIN {printf \"%.1f KB\", $bytes/1024}"
+          else
+            echo "${bytes} B"
+          fi
+        }
+
+        echo "--- Verifying GNU Bash ---"
+        BASH_BYTES=$(stat -c%s ${{ env.WEAPONDIR }}/weaponx)
+        echo "BASH_SIZE=$(human_size $BASH_BYTES)" >> $GITHUB_ENV
+        WEAPONX_VER=$(qemu-aarch64-static ${{ env.WEAPONDIR }}/weaponx --version 2>&1 | grep "version" | head -1 | cut -d' ' -f4 | cut -d'(' -f1)
+        echo "WEAPONX_VER=$WEAPONX_VER" >> $GITHUB_ENV
+        qemu-aarch64-static ${{ env.WEAPONDIR }}/weaponx --help > bash_help.txt 2>&1 || true
+
+        if [ "$(qemu-aarch64-static ${{ env.WEAPONDIR }}/weaponx -c 'echo $((2+3))')" = "5" ] \
+           && echo ok > canary \
+           && qemu-aarch64-static ${{ env.WEAPONDIR }}/weaponx -c 'rm canary' \
+           && [ ! -f canary ]; then
+          echo "BASH_VERIFY=true" >> $GITHUB_ENV
+        else
+          echo "BASH_VERIFY=false" >> $GITHUB_ENV
+        fi
+
+        echo "--- Verifying inotifywait ---"
+        IW_BYTES=$(stat -c%s ${{ env.INOTIFY_BIN_DIR }}/inotifywait)
+        echo "INOTIFY_WAIT_SIZE=$(human_size $IW_BYTES)" >> $GITHUB_ENV
+        INOTIFY_VER=$(qemu-aarch64-static ${{ env.INOTIFY_BIN_DIR }}/inotifywait -h 2>&1 | head -1 | cut -d' ' -f2)
+        echo "INOTIFY_VER=$INOTIFY_VER" >> $GITHUB_ENV
+        qemu-aarch64-static ${{ env.INOTIFY_BIN_DIR }}/inotifywait --help > inotifywait_help.txt 2>&1 || true
+
+        echo "--- Verifying inotifywatch ---"
+        IWATCH_BYTES=$(stat -c%s ${{ env.INOTIFY_BIN_DIR }}/inotifywatch)
+        echo "INOTIFY_WATCH_SIZE=$(human_size $IWATCH_BYTES)" >> $GITHUB_ENV
+        qemu-aarch64-static ${{ env.INOTIFY_BIN_DIR }}/inotifywatch --help > inotifywatch_help.txt 2>&1 || true
+
+        if mkdir -p ino_test \
+           && (qemu-aarch64-static ${{ env.INOTIFY_BIN_DIR }}/inotifywait -m -q ino_test > ino_event.txt & \
+               INO_PID=$!; \
+               sleep 2; touch ino_test/canary; sleep 2; kill $INO_PID) \
+           && grep -q canary ino_event.txt; then
+          echo "INOTIFY_VERIFY=true" >> $GITHUB_ENV
+        else
+          echo "INOTIFY_VERIFY=false" >> $GITHUB_ENV
+        fi
+        rm -rf ino_test ino_event.txt
+
+        echo "--- Verifying jq ---"
+        JQ_BYTES=$(stat -c%s ${{ env.JQDIR }}/jq)
+        echo "JQ_SIZE=$(human_size $JQ_BYTES)" >> $GITHUB_ENV
+        JQ_VER=$(qemu-aarch64-static ${{ env.JQDIR }}/jq -V 2>&1 | cut -d'-' -f2)
+        echo "JQ_VER=$JQ_VER" >> $GITHUB_ENV
+        qemu-aarch64-static ${{ env.JQDIR }}/jq --help > jq_help.txt 2>&1 || true
+
+        if [ "$(qemu-aarch64-static ${{ env.JQDIR }}/jq -r .version <<< '{"version":"1.2.3"}')" = "1.2.3" ]; then
+          echo "JQ_VERIFY=true" >> $GITHUB_ENV
+        else
+          echo "JQ_VERIFY=false" >> $GITHUB_ENV
+        fi
+
+        echo "--- Verifying zip ---"
+        ZIP_BYTES=$(stat -c%s ${{ env.ZIPDIR }}/zip)
+        echo "ZIP_SIZE=$(human_size $ZIP_BYTES)" >> $GITHUB_ENV
+        ZIP_VER=$(qemu-aarch64-static ${{ env.ZIPDIR }}/zip -v 2>&1 | grep "This is Zip" | cut -d' ' -f4)
+        echo "ZIP_VER=$ZIP_VER" >> $GITHUB_ENV
+        qemu-aarch64-static ${{ env.ZIPDIR }}/zip -h > zip_help.txt 2>&1 || true
+
+        if echo hello > zipcanary.txt \
+           && qemu-aarch64-static ${{ env.ZIPDIR }}/zip -q zipcanary.zip zipcanary.txt \
+           && python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('zipcanary.zip').read('zipcanary.txt')==b'hello\\n' else 1)"; then
+          echo "ZIP_VERIFY=true" >> $GITHUB_ENV
+        else
+          echo "ZIP_VERIFY=false" >> $GITHUB_ENV
+        fi
+        rm -f zipcanary.txt zipcanary.zip
+
+        echo "--- Verifying abx ---"
+        ABX_BYTES=$(stat -c%s src/build_abx/abx)
+        echo "ABX_SIZE=$(human_size $ABX_BYTES)" >> $GITHUB_ENV
+        ABX_VER=$(qemu-aarch64-static src/build_abx/abx --version 2>&1 | awk '{print $2}')
+        echo "ABX_VER=$ABX_VER" >> $GITHUB_ENV
+        qemu-aarch64-static src/build_abx/abx --help > abx_help.txt 2>&1 || true
+
+        if printf '%s' '<?xml version="1.0" encoding="UTF-8"?><settings version="3"><setting id="1" name="brightness" value="128" enabled="true"/></settings>' > rt.xml \
+           && qemu-aarch64-static src/build_abx/abx rt.xml rt.abx \
+           && qemu-aarch64-static src/build_abx/abx rt.abx rt_out.xml \
+           && python3 -c "
+        import xml.etree.ElementTree as ET
+        a = ET.parse('rt.xml').getroot()
+        b = ET.parse('rt_out.xml').getroot()
+        def canon(e):
+            return (e.tag, sorted(e.attrib.items()), (e.text or '').strip(), [canon(c) for c in e])
+        assert canon(a) == canon(b), 'round-trip mismatch'
+        print('abx round-trip: semantically identical')
+        "; then
+          echo "ABX_VERIFY=true" >> $GITHUB_ENV
+        else
+          echo "ABX_VERIFY=false" >> $GITHUB_ENV
+        fi
+        rm -f rt.xml rt.abx rt_out.xml
+
+    - name: Generate Release Notes
+      if: success()
+      run: |
+        cat <<EOF > release_notes.md
+        # Ultimate Android ARM64 Static Toolkit
+
+        **Trigger Type:** ${{ env.TRIGGER_TYPE }}
+
+        ### 📦 Build Information
+        - Target: Android ARM64 (\`aarch64\`)
+        - Type: 100% Static Binaries
+
+        | Binary | Version | Size |
+        | :--- | :--- | :--- |
+        | **GNU Bash** | v${{ env.WEAPONX_VER }} | ${{ env.BASH_SIZE }} |
+        | **inotifywait** | v${{ env.INOTIFY_VER }} | ${{ env.INOTIFY_WAIT_SIZE }} |
+        | **inotifywatch** | v${{ env.INOTIFY_VER }} | ${{ env.INOTIFY_WATCH_SIZE }} |
+        | **jq** | v${{ env.JQ_VER }} | ${{ env.JQ_SIZE }} |
+        | **zip** | v${{ env.ZIP_VER }} | ${{ env.ZIP_SIZE }} |
+        | **abx** | v${{ env.ABX_VER }} | ${{ env.ABX_SIZE }} |
+
+        ---
+
+        ## 📖 Binary Usage Reference
+        EOF
+
+        echo -e "\n<details>\n<summary><b>GNU Bash</b></summary>\n\n\`\`\`text" >> release_notes.md
+        cat bash_help.txt >> release_notes.md
+        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+
+        echo -e "\n<details>\n<summary><b>inotifywait</b></summary>\n\n\`\`\`text" >> release_notes.md
+        cat inotifywait_help.txt >> release_notes.md
+        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+
+        echo -e "\n<details>\n<summary><b>inotifywatch</b></summary>\n\n\`\`\`text" >> release_notes.md
+        cat inotifywatch_help.txt >> release_notes.md
+        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+
+        echo -e "\n<details>\n<summary><b>jq</b></summary>\n\n\`\`\`text" >> release_notes.md
+        cat jq_help.txt >> release_notes.md
+        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+
+        echo -e "\n<details>\n<summary><b>zip</b></summary>\n\n\`\`\`text" >> release_notes.md
+        cat zip_help.txt >> release_notes.md
+        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+
+        echo -e "\n<details>\n<summary><b>abx (unified ABX <-> XML converter)</b></summary>\n\n\`\`\`text" >> release_notes.md
+        cat abx_help.txt >> release_notes.md
+        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+
+        cat <<EOF >> release_notes.md
+
+        **Note:**
+        > These are fully static binaries ready to be dropped into \`/data/adb/modules/\` or \`/system/bin/\` on any ARM64 Android device.
+        EOF
+
+    - name: Create Unified Release
+      if: success()
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GHTOKEN }}
+      with:
+        repository: ${{ env.SOURCE_REPO }}
+        files: |
+          ${{ env.WEAPONDIR }}/weaponx
+          ${{ env.INOTIFY_BIN_DIR }}/inotifywait
+          ${{ env.INOTIFY_BIN_DIR }}/inotifywatch
+          ${{ env.JQDIR }}/jq
+          ${{ env.ZIPDIR }}/zip
+          src/build_abx/abx
+        tag_name: toolkit-${{ env.BUILD_TAG }}
+        name: Android ARM64 Static Toolkit - ${{ env.BUILD_DATE }}
+        body_path: release_notes.md
+        draft: false
+        prerelease: false
+
+    - name: Notify Telegram
+      if: always()
+      env:
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        CHAT_ID: ${{ secrets.TEST_BUILDS }}
+      run: |
+        BUILD_SECONDS=$(( $(date +%s) - $(cat /tmp/build_start_ts) ))
+        DURATION="$(( BUILD_SECONDS / 60 ))m $(( BUILD_SECONDS % 60 ))s"
+
+        RELEASE_URL="${{ github.server_url }}/${{ env.SOURCE_REPO }}/releases/tag/toolkit-${BUILD_TAG}"
+        REPO_URL="${{ github.server_url }}/${{ env.SOURCE_REPO }}"
+        LOGS_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        bash_state() {
+          local name="$1" ok="$2" attempted="$3" verify="${4:-}" t="${5:-n/a}" icon state
+          if [ "$ok" = "true" ] && [ "$verify" != "false" ]; then
+            icon="✅"; state="Pass"
+          elif [ "$ok" = "true" ] && [ "$verify" = "false" ]; then
+            icon="❌"; state="Verify fail"
+          elif [ "$attempted" = "true" ]; then
+            icon="❌"; state="Fail"
+          else
+            icon="⏭️"; state="Skipped"
+          fi
+          echo "$icon <b>$name</b> — $state ($t)"
+        }
+
+        RESULTS=""
+        RESULTS+="$(bash_state "GNU Bash" "${WEAPONX_OK:-}" "${BASH_ATTEMPTED:-}" "${BASH_VERIFY:-}" "${BASH_BUILD_TIME:-n/a}")"$'\n'
+        RESULTS+="$(bash_state "inotifywait" "${INOTIFYWAIT_OK:-}" "${INOTIFY_ATTEMPTED:-}" "${INOTIFY_VERIFY:-}" "${INOTIFY_BUILD_TIME:-n/a}")"$'\n'
+        RESULTS+="$(bash_state "inotifywatch" "${INOTIFYWATCH_OK:-}" "${INOTIFY_ATTEMPTED:-}" "${INOTIFY_VERIFY:-}" "${INOTIFY_BUILD_TIME:-n/a}")"$'\n'
+        RESULTS+="$(bash_state "jq" "${JQ_OK:-}" "${JQ_ATTEMPTED:-}" "${JQ_VERIFY:-}" "${JQ_BUILD_TIME:-n/a}")"$'\n'
+        RESULTS+="$(bash_state "zip" "${ZIP_OK:-}" "${ZIP_ATTEMPTED:-}" "${ZIP_VERIFY:-}" "${ZIP_BUILD_TIME:-n/a}")"$'\n'
+        RESULTS+="$(bash_state "abx" "${ABX_OK:-}" "${ABX_ATTEMPTED:-}" "${ABX_VERIFY:-}" "${ABX_BUILD_TIME:-n/a}")"
+
+        if [ "${{ job.status }}" = "success" ]; then
+          RELEASE_BUTTON='{ "text": "Release 📦", "url": "'"${RELEASE_URL}"'", "style": "primary" },'
+          check_ok() { if [ "$1" = "true" ]; then echo "Pass"; else echo "Fail"; fi; }
+
+          cat > /tmp/rich_payload.json <<EOF
+          {
+            "chat_id": "${CHAT_ID}",
+            "rich_message": {
+              "blocks": [
+                { "type": "heading", "text": "✅ Android ARM64 Static Toolkit", "size": 1 },
+                { "type": "paragraph", "text": "Status: Success\nTrigger: ${TRIGGER_TYPE}\nDate: ${BUILD_DATE}\nTime: ${BUILD_TIME}" },
+                { "type": "divider" },
+                { "type": "heading", "text": "📦 Binaries Built", "size": 2 },
+                {
+                  "type": "table", "is_compact": true, "is_bordered": true,
+                  "cells": [
+                    [
+                      {"text": "Binary", "is_header": true, "align": "left"},
+                      {"text": "Version", "is_header": true, "align": "left"},
+                      {"text": "Size", "is_header": true, "align": "right"}
+                    ],
+                    [
+                      {"text": "GNU Bash"},
+                      {"text": "v${WEAPONX_VER}"},
+                      {"text": "${BASH_SIZE}", "align": "right"}
+                    ],
+                    [
+                      {"text": "inotifywait"},
+                      {"text": "v${INOTIFY_VER}"},
+                      {"text": "${INOTIFY_WAIT_SIZE}", "align": "right"}
+                    ],
+                    [
+                      {"text": "inotifywatch"},
+                      {"text": "v${INOTIFY_VER}"},
+                      {"text": "${INOTIFY_WATCH_SIZE}", "align": "right"}
+                    ],
+                    [
+                      {"text": "jq"},
+                      {"text": "v${JQ_VER}"},
+                      {"text": "${JQ_SIZE}", "align": "right"}
+                    ],
+                    [
+                      {"text": "zip"},
+                      {"text": "v${ZIP_VER}"},
+                      {"text": "${ZIP_SIZE}", "align": "right"}
+                    ],
+                    [
+                      {"text": "abx"},
+                      {"text": "v${ABX_VER}"},
+                      {"text": "${ABX_SIZE}", "align": "right"}
+                    ]
+                  ]
+                },
+                { "type": "divider" },
+                { "type": "heading", "text": "🔍 Verification", "size": 2 },
+                {
+                  "type": "table", "is_compact": true, "is_bordered": true,
+                  "cells": [
+                    [
+                      {"text": "Binary", "is_header": true, "align": "left"},
+                      {"text": "Status", "is_header": true, "align": "left"},
+                      {"text": "Build Time", "is_header": true, "align": "right"}
+                    ],
+                    [
+                      {"text": "GNU Bash"},
+                      {"text": "$(check_ok "${BASH_VERIFY:-false}")"},
+                      {"text": "${BASH_BUILD_TIME:-n/a}", "align": "right"}
+                    ],
+                    [
+                      {"text": "inotifywait"},
+                      {"text": "$(check_ok "${INOTIFY_VERIFY:-false}")"},
+                      {"text": "${INOTIFY_BUILD_TIME:-n/a}", "align": "right"}
+                    ],
+                    [
+                      {"text": "inotifywatch"},
+                      {"text": "Pass"},
+                      {"text": "${INOTIFY_BUILD_TIME:-n/a}", "align": "right"}
+                    ],
+                    [
+                      {"text": "jq"},
+                      {"text": "$(check_ok "${JQ_VERIFY:-false}")"},
+                      {"text": "${JQ_BUILD_TIME:-n/a}", "align": "right"}
+                    ],
+                    [
+                      {"text": "zip"},
+                      {"text": "$(check_ok "${ZIP_VERIFY:-false}")"},
+                      {"text": "${ZIP_BUILD_TIME:-n/a}", "align": "right"}
+                    ],
+                    [
+                      {"text": "abx"},
+                      {"text": "$(check_ok "${ABX_VERIFY:-false}")"},
+                      {"text": "${ABX_BUILD_TIME:-n/a}", "align": "right"}
+                    ]
+                  ]
+                },
+                { "type": "divider" },
+                { "type": "footer", "text": "Static aarch64 binaries built by GitHub Actions • Total build: ${DURATION}" },
+                {
+                  "type": "buttons",
+                  "align": "left",
+                  "buttons": [
+                    ${RELEASE_BUTTON}
+                    { "text": "Logs 📋", "url": "${LOGS_URL}", "style": "danger" },
+                    { "text": "Repo 🏠", "url": "${REPO_URL}", "style": "success" }
+                  ]
+                }
+              ]
+            }
+          }
+          EOF
+
+          HTTP_CODE=$(curl -s -o /tmp/tg_response.json -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d @/tmp/rich_payload.json \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendRichMessage")
+
+          echo "HTTP: $HTTP_CODE"
+          cat /tmp/tg_response.json
+
+          if ! grep -q '"ok":true' /tmp/tg_response.json; then
+            echo "::warning::sendRichMessage failed, falling back to sendMessage"
+            cat > /tmp/fallback_payload.json <<EOF
+          {
+            "chat_id": "${CHAT_ID}",
+            "text": "✅ <b>Android ARM64 Static Toolkit</b>\n<b>Status:</b> Success\n<b>Trigger:</b> ${TRIGGER_TYPE}\n<b>Date:</b> ${BUILD_DATE}\n<b>Time:</b> ${BUILD_TIME}\n<b>Build duration:</b> ${DURATION}\n\n<a href=\"${RELEASE_URL}\">Release 📦</a> | <a href=\"${LOGS_URL}\">Logs 📋</a> | <a href=\"${REPO_URL}\">Repo 🏠</a>",
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true
+          }
+          EOF
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              -d @/tmp/fallback_payload.json \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+          fi
+        else
+          cat > /tmp/tg_caption.txt <<EOF
+          ❌ <b>Android ARM64 Static Toolkit</b>
+          <b>Status:</b> Failed
+          <b>Trigger:</b> ${TRIGGER_TYPE}
+          <b>Date:</b> ${BUILD_DATE} ${BUILD_TIME}
+          <b>Build duration:</b> ${DURATION}
+
+          <b>Results:</b>
+          ${RESULTS}
+
+          📋 Full build log attached.
+          <a href="${LOGS_URL}">Run page</a> | <a href="${REPO_URL}">Repo 🏠</a>
+          EOF
+
+          if [ -f /tmp/toolkit_build.log ]; then
+            HTTP_CODE=$(curl -s -o /tmp/tg_response.json -w "%{http_code}" \
+              --form-string "chat_id=${CHAT_ID}" \
+              -F "document=@/tmp/toolkit_build.log" \
+              --form-string "caption=$(cat /tmp/tg_caption.txt)" \
+              --form-string "parse_mode=HTML" \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument")
+            echo "HTTP: $HTTP_CODE"
+            cat /tmp/tg_response.json
+          fi
+
+          if [ ! -f /tmp/toolkit_build.log ] || ! grep -q '"ok":true' /tmp/tg_response.json; then
+            echo "::warning::sendDocument failed or no log, falling back to sendMessage"
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=$(cat /tmp/tg_caption.txt)" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+          fi
+        fi
+
+    - name: Dispatch Cleanup
+      if: always()
+      env:
+        GH_TOKEN: ${{ secrets.GHTOKEN }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ github.run_id }}
+        REF: ${{ github.ref_name }}
+      run: |
+        gh workflow run cleanup.yml --repo "$REPO" \
+          -f "repo=$REPO" \
+          -f "run_id=$RUN_ID" \
+          -f "keep=$CLEANUP_KEEP" \
+          -f "branch=$REF" \
+        || echo "::warning::cleanup dispatch failed (build unaffected)"
