@@ -570,7 +570,7 @@ jobs:
               ]
             }
           }
-          EOF
+        EOF
 
           HTTP_CODE=$(curl -s -o /tmp/tg_response.json -w "%{http_code}" \
             -X POST \
@@ -590,7 +590,7 @@ jobs:
             "parse_mode": "HTML",
             "disable_web_page_preview": true
           }
-          EOF
+        EOF
             curl -s -X POST \
               -H "Content-Type: application/json" \
               -d @/tmp/fallback_payload.json \
@@ -609,7 +609,7 @@ jobs:
 
           📋 Full build log attached.
           <a href="${LOGS_URL}">Run page</a> | <a href="${REPO_URL}">Repo 🏠</a>
-          EOF
+        EOF
 
           if [ -f /tmp/toolkit_build.log ]; then
             HTTP_CODE=$(curl -s -o /tmp/tg_response.json -w "%{http_code}" \
