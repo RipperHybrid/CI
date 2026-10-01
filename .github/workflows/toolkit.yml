@@ -2,6 +2,19 @@ name: Toolkit Static Builder
 
 on:
   workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo'
+        required: false
+        default: 'RipperHybrid/ToolKit'
+      target_branch:
+        description: 'Branch'
+        required: false
+        default: 'Master'
+      cleanup_keep:
+        description: 'Completed runs to keep'
+        required: false
+        default: '0'
   schedule:
     - cron: '0 0 1 * *'
 
@@ -10,9 +23,9 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  SOURCE_REPO: RipperHybrid/ToolKit
-  TARGET_BRANCH: Master
-  CLEANUP_KEEP: 0
+  SOURCE_REPO: ${{ github.event.inputs.source_repo || 'RipperHybrid/ToolKit' }}
+  TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'Master' }}
+  CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
 
 jobs:
   build-android-binaries:

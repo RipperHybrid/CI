@@ -2,14 +2,27 @@ name: FontCraft CI
 
 on:
   workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo'
+        required: false
+        default: 'RipperHybrid/sbx'
+      target_branch:
+        description: 'Branch'
+        required: false
+        default: 'ExCraft'
+      cleanup_keep:
+        description: 'Completed runs to keep'
+        required: false
+        default: '0'
 
 permissions:
   contents: read
 
 env:
-  SOURCE_REPO: RipperHybrid/sbx
-  TARGET_BRANCH: ExCraft
-  CLEANUP_KEEP: 0
+  SOURCE_REPO: ${{ github.event.inputs.source_repo || 'RipperHybrid/sbx' }}
+  TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'ExCraft' }}
+  CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
   LOG: /tmp/build.log
 
 jobs:
