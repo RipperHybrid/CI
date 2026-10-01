@@ -7,6 +7,25 @@ import sys
 import time
 
 
+DEFAULT_HTML = (
+    "Repo: <b>{repo_name}</b> [{branch}]\n"
+    "Run from: {ci_name} (#{run_number})\n\n"
+    "☢️ Dev Build\n\n"
+    "<pre>Commit\n{commit_msg}</pre>\n"
+    "Version: {version}\n"
+    "Build Time: {runtime}\n"
+)
+
+DEFAULT_MD = (
+    "Repo: **{repo_name}** [{branch}]\n"
+    "Run from: {ci_name} (#{run_number})\n\n"
+    "☢️ Dev Build\n\n"
+    "Commit\n````\n{commit_msg}\n````\n\n"
+    "Version: {version}\n"
+    "Build Time: {runtime}\n"
+)
+
+
 def sh(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
 
@@ -57,7 +76,18 @@ def cmd_metadata(args):
     gh_output("filename", f"{args.prefix}_{version}_{version_code}_by_{owner}.zip")
 
 
-def compose(branch, source_repo, version, runtime, run_number, as_html):
+def read_template(args, kind):
+    path = args.msg_file if kind == "msg" else args.notes_file
+    if path and os.path.exists(path):
+        with open(path) as f:
+            return f.read()
+    value = args.msg if kind == "msg" else args.notes
+    if value:
+        return value
+    return None
+
+
+def compose(template, *, branch, source_repo, version, runtime, run_number, as_html):
     repo_name = source_repo.split("/", 1)[1]
     ci_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
     commit_msg = sh("git log -1 --pretty=%B")
@@ -66,34 +96,38 @@ def compose(branch, source_repo, version, runtime, run_number, as_html):
 
     if as_html:
         if len(commit_msg) > 700:
-            msg = commit_url
+            rendered = commit_url
         else:
-            msg = commit_msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        out = f"Repo: <b>{repo_name}</b> [{branch}]\n"
-        out += f"Run from: {ci_name} (#{run_number})\n\n"
-        out += "☢️ Dev Build\n\n"
-        out += f"<pre>Commit\n{msg}</pre>\n"
+            rendered = commit_msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     else:
-        out = f"Repo: **{repo_name}** [{branch}]\n"
-        out += f"Run from: {ci_name} (#{run_number})\n\n"
-        out += "☢️ Dev Build\n\n"
-        out += f"Commit\n````\n{commit_msg}\n````\n\n"
+        rendered = commit_url if len(commit_msg) > 700 else commit_msg
 
-    out += f"Version: {version or 'n/a'}\n"
-    out += f"Build Time: {runtime}\n"
-    return out
+    values = {
+        "repo_name": repo_name,
+        "branch": branch,
+        "ci_name": ci_name,
+        "run_number": run_number,
+        "commit_msg": rendered,
+        "commit_url": commit_url,
+        "version": version or "n/a",
+        "runtime": runtime,
+    }
+    return template.format(**values)
 
 
-def send_telegram(bot_token, chat_id, zip_path, source_repo, tag, has_log):
-    repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{source_repo}"
-    buttons = [
+def resolve_buttons(args, repo_url, tag):
+    if args.buttons_file and os.path.exists(args.buttons_file):
+        with open(args.buttons_file) as f:
+            return json.load(f)
+    if args.buttons:
+        return json.loads(args.buttons)
+
+    return {"inline_keyboard": [[
         {"text": "Release 📦", "url": f"{repo_url}/releases/tag/{tag}"},
-        {"text": "Repo 🏠", "url": repo_url},
-    ]
-    if has_log:
-        buttons.append({"text": "Log ⚒️", "url": f"{repo_url}/releases/download/{tag}/{tag}.log"})
-    keyboard = json.dumps({"inline_keyboard": [buttons]})
+    ]]}
 
+
+def send_telegram(bot_token, chat_id, zip_path, keyboard):
     with open("/tmp/tg_caption.txt") as f:
         caption = f.read()
 
@@ -103,7 +137,7 @@ def send_telegram(bot_token, chat_id, zip_path, source_repo, tag, has_log):
         "-F", f"document=@{zip_path}",
         "--form-string", f"caption={caption}",
         "--form-string", "parse_mode=HTML",
-        "--form-string", f"reply_markup={keyboard}",
+        "--form-string", f"reply_markup={json.dumps(keyboard)}",
         f"https://api.telegram.org/bot{bot_token}/sendDocument",
     ])
 
@@ -118,8 +152,15 @@ def cmd_publish(args):
             d = int(time.time()) - int(f.read().strip())
         runtime = f"{d // 60}m {d % 60}s"
 
-    notes = compose(args.branch, args.source_repo, args.version, runtime, run_number, False)
-    caption = compose(args.branch, args.source_repo, args.version, runtime, run_number, True)
+    html_tpl = read_template(args, "msg") or DEFAULT_HTML
+    md_tpl = read_template(args, "notes") or DEFAULT_MD
+
+    notes = compose(md_tpl, branch=args.branch, source_repo=args.source_repo,
+                    version=args.version, runtime=runtime,
+                    run_number=run_number, as_html=False)
+    caption = compose(html_tpl, branch=args.branch, source_repo=args.source_repo,
+                      version=args.version, runtime=runtime,
+                      run_number=run_number, as_html=True)
 
     with open("/tmp/notes.md", "w") as f:
         f.write(notes)
@@ -160,7 +201,9 @@ def cmd_publish(args):
     bot_token = os.environ.get("BOT_TOKEN")
     chat_id = os.environ.get("CHAT_ID")
     if bot_token and chat_id and args.zip and os.path.exists(args.zip):
-        send_telegram(bot_token, chat_id, args.zip, args.source_repo, tag, has_log)
+        repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{args.source_repo}"
+        keyboard = resolve_buttons(args, repo_url, tag)
+        send_telegram(bot_token, chat_id, args.zip, keyboard)
 
     cleanup_workflow = os.path.join(
         os.environ.get("GITHUB_WORKSPACE", "."), ".github", "workflows", "cleanup.yml"
@@ -206,6 +249,12 @@ def main():
     p_pub.add_argument("--log", default="")
     p_pub.add_argument("--cleanup-keep", default="")
     p_pub.add_argument("--start-ts-file", default="")
+    p_pub.add_argument("--msg", default="")
+    p_pub.add_argument("--msg-file", default="")
+    p_pub.add_argument("--notes", default="")
+    p_pub.add_argument("--notes-file", default="")
+    p_pub.add_argument("--buttons", default="")
+    p_pub.add_argument("--buttons-file", default="")
     p_pub.set_defaults(func=cmd_publish)
 
     args = parser.parse_args()
