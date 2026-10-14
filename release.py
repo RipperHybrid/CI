@@ -9,7 +9,9 @@ import time
 
 DEFAULT_HTML = (
     "Repo: <b>{repo_name}</b> [{branch}]\n"
-    "Run from: {ci_name} (#{run_number})\n\n"
+    "Run from: {ci_name} (#{run_number})\n"
+    "Commit No: {commit_no}\n"
+    "Hash: {commit_short}\n\n"
     "☢️ Dev Build\n\n"
     "<pre>Commit\n{commit_msg}</pre>\n"
     "Version: {version}\n"
@@ -18,7 +20,9 @@ DEFAULT_HTML = (
 
 DEFAULT_MD = (
     "Repo: **{repo_name}** [{branch}]\n"
-    "Run from: {ci_name} (#{run_number})\n\n"
+    "Run from: {ci_name} (#{run_number})\n"
+    "Commit No: {commit_no}\n"
+    "Hash: {commit_short}\n\n"
     "☢️ Dev Build\n\n"
     "Commit\n````\n{commit_msg}\n````\n\n"
     "Version: {version}\n"
@@ -54,7 +58,10 @@ def gh_output(key, value):
 def cmd_metadata(args):
     run_number = os.environ["GITHUB_RUN_NUMBER"]
     version = f"V{run_number}"
-    version_code = sh("git rev-parse --short HEAD")
+    commit_hash = sh("git rev-parse --short HEAD")
+    commit_count = sh("git rev-list --count HEAD")
+    if not commit_count.isdigit():
+        commit_count = run_number
     owner = os.environ["GITHUB_REPOSITORY_OWNER"]
 
     with open(args.module_prop) as f:
@@ -65,7 +72,7 @@ def cmd_metadata(args):
         if line.startswith("version="):
             out.append(f"version={version}")
         elif line.startswith("versionCode="):
-            out.append(f"versionCode={version_code}")
+            out.append(f"versionCode={commit_count}")
         else:
             out.append(line)
 
@@ -73,7 +80,7 @@ def cmd_metadata(args):
         f.write("\n".join(out) + "\n")
 
     gh_output("version", version)
-    gh_output("filename", f"{args.prefix}_{version}_{version_code}_by_{owner}.zip")
+    gh_output("filename", f"{args.prefix}_{version}_{commit_hash}_by_{owner}.zip")
 
 
 def read_template(args, kind):
@@ -92,6 +99,8 @@ def compose(template, *, branch, source_repo, version, runtime, run_number, as_h
     ci_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
     commit_msg = sh("git log -1 --pretty=%B")
     commit_hash = sh("git rev-parse HEAD")
+    commit_short = sh("git rev-parse --short HEAD")
+    commit_no = sh("git rev-list --count HEAD") or "n/a"
     commit_url = f"{os.environ['GITHUB_SERVER_URL']}/{source_repo}/commit/{commit_hash}"
 
     if as_html:
@@ -109,6 +118,9 @@ def compose(template, *, branch, source_repo, version, runtime, run_number, as_h
         "run_number": run_number,
         "commit_msg": rendered,
         "commit_url": commit_url,
+        "commit_no": commit_no,
+        "commit_short": commit_short,
+        "commit_hash": commit_hash,
         "version": version or "n/a",
         "runtime": runtime,
     }
