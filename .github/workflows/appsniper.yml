@@ -11,6 +11,10 @@ on:
         description: 'Branch'
         required: false
         default: 'Master'
+      target_commit:
+        description: 'Commit SHA (optional, overrides branch)'
+        required: false
+        default: ''
       cleanup_keep:
         description: 'Completed runs to keep'
         required: false
@@ -22,6 +26,7 @@ permissions:
 env:
   SOURCE_REPO: ${{ github.event.inputs.source_repo || 'RipperHybrid/AppSniper' }}
   TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'Master' }}
+  TARGET_COMMIT: ${{ github.event.inputs.target_commit || '' }}
   CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
   LOG: /tmp/build.log
 
@@ -39,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.TARGET_BRANCH }}
+          ref: ${{ env.TARGET_COMMIT != '' && env.TARGET_COMMIT || env.TARGET_BRANCH }}
           token: ${{ secrets.GHTOKEN }}
           fetch-depth: 0
           path: src

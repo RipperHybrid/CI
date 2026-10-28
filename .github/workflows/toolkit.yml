@@ -11,6 +11,10 @@ on:
         description: 'Branch'
         required: false
         default: 'Master'
+      target_commit:
+        description: 'Commit SHA (optional, overrides branch)'
+        required: false
+        default: ''
       cleanup_keep:
         description: 'Completed runs to keep'
         required: false
@@ -25,6 +29,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   SOURCE_REPO: ${{ github.event.inputs.source_repo || 'RipperHybrid/ToolKit' }}
   TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'Master' }}
+  TARGET_COMMIT: ${{ github.event.inputs.target_commit || '' }}
   CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
 
 jobs:
@@ -47,12 +52,13 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: ${{ env.SOURCE_REPO }}
-        ref: ${{ env.TARGET_BRANCH }}
+        ref: ${{ env.TARGET_COMMIT != '' && env.TARGET_COMMIT || env.TARGET_BRANCH }}
         token: ${{ secrets.GHTOKEN }}
         fetch-depth: 0
         path: src
 
     - name: Preflight GitLab Check
+      if: ${{ env.TARGET_COMMIT == '' }}
       env:
         GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
       run: |
@@ -69,6 +75,7 @@ jobs:
         echo "GitLab preflight OK"
 
     - name: Sync to GitLab
+      if: ${{ env.TARGET_COMMIT == '' }}
       working-directory: src
       env:
         GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
@@ -83,7 +90,7 @@ jobs:
         date +%s > /tmp/build_start_ts
         echo "BUILD_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
         echo "BUILD_TIME=$(TZ='Asia/Kolkata' date +'%I:%M:%S %p IST')" >> $GITHUB_ENV
-        echo "BUILD_TAG=$(date +'%Y%m%d')" >> $GITHUB_ENV
+        echo "BUILD_TAG=$(date +'%Y%m%d')-$(git -C src rev-parse --short HEAD)" >> $GITHUB_ENV
         : > /tmp/toolkit_build.log
 
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -359,7 +366,7 @@ jobs:
 
         if echo hello > zipcanary.txt \
            && qemu-aarch64-static ${{ env.ZIPDIR }}/zip -q zipcanary.zip zipcanary.txt \
-           && python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('zipcanary.zip').read('zipcanary.txt')==b'hello\\n' else 1)"; then
+           && python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('zipcanary.zip').read('zipcanary.txt')==b'hello\n' else 1)"; then
           echo "ZIP_VERIFY=true" >> $GITHUB_ENV
         else
           echo "ZIP_VERIFY=false" >> $GITHUB_ENV
@@ -417,29 +424,29 @@ jobs:
         ## 📖 Binary Usage Reference
         EOF
 
-        echo -e "\n<details>\n<summary><b>GNU Bash</b></summary>\n\n\`\`\`text" >> release_notes.md
+        echo -e "\\n<details>\\n<summary><b>GNU Bash</b></summary>\\n\\n\\`\\`\\`text" >> release_notes.md
         cat bash_help.txt >> release_notes.md
-        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+        echo -e "\\n\\`\\`\\`\\n</details>" >> release_notes.md
 
-        echo -e "\n<details>\n<summary><b>inotifywait</b></summary>\n\n\`\`\`text" >> release_notes.md
+        echo -e "\\n<details>\\n<summary><b>inotifywait</b></summary>\\n\\n\\`\\`\\`text" >> release_notes.md
         cat inotifywait_help.txt >> release_notes.md
-        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+        echo -e "\\n\\`\\`\\`\\n</details>" >> release_notes.md
 
-        echo -e "\n<details>\n<summary><b>inotifywatch</b></summary>\n\n\`\`\`text" >> release_notes.md
+        echo -e "\\n<details>\\n<summary><b>inotifywatch</b></summary>\\n\\n\\`\\`\\`text" >> release_notes.md
         cat inotifywatch_help.txt >> release_notes.md
-        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+        echo -e "\\n\\`\\`\\`\\n</details>" >> release_notes.md
 
-        echo -e "\n<details>\n<summary><b>jq</b></summary>\n\n\`\`\`text" >> release_notes.md
+        echo -e "\\n<details>\\n<summary><b>jq</b></summary>\\n\\n\\`\\`\\`text" >> release_notes.md
         cat jq_help.txt >> release_notes.md
-        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+        echo -e "\\n\\`\\`\\`\\n</details>" >> release_notes.md
 
-        echo -e "\n<details>\n<summary><b>zip</b></summary>\n\n\`\`\`text" >> release_notes.md
+        echo -e "\\n<details>\\n<summary><b>zip</b></summary>\\n\\n\\`\\`\\`text" >> release_notes.md
         cat zip_help.txt >> release_notes.md
-        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+        echo -e "\\n\\`\\`\\`\\n</details>" >> release_notes.md
 
-        echo -e "\n<details>\n<summary><b>abx (unified ABX <-> XML converter)</b></summary>\n\n\`\`\`text" >> release_notes.md
+        echo -e "\\n<details>\\n<summary><b>abx (unified ABX <-> XML converter)</b></summary>\\n\\n\\`\\`\\`text" >> release_notes.md
         cat abx_help.txt >> release_notes.md
-        echo -e "\n\`\`\`\n</details>" >> release_notes.md
+        echo -e "\\n\\`\\`\\`\\n</details>" >> release_notes.md
 
         cat <<EOF >> release_notes.md
 
@@ -552,11 +559,11 @@ jobs:
         }
 
         RESULTS=""
-        RESULTS+="$(bash_state "GNU Bash" "${WEAPONX_OK:-}" "${BASH_ATTEMPTED:-}" "${BASH_VERIFY:-}" "${BASH_BUILD_TIME:-n/a}")"$'\n'
-        RESULTS+="$(bash_state "inotifywait" "${INOTIFYWAIT_OK:-}" "${INOTIFY_ATTEMPTED:-}" "${INOTIFY_VERIFY:-}" "${INOTIFY_BUILD_TIME:-n/a}")"$'\n'
-        RESULTS+="$(bash_state "inotifywatch" "${INOTIFYWATCH_OK:-}" "${INOTIFY_ATTEMPTED:-}" "${INOTIFY_VERIFY:-}" "${INOTIFY_BUILD_TIME:-n/a}")"$'\n'
-        RESULTS+="$(bash_state "jq" "${JQ_OK:-}" "${JQ_ATTEMPTED:-}" "${JQ_VERIFY:-}" "${JQ_BUILD_TIME:-n/a}")"$'\n'
-        RESULTS+="$(bash_state "zip" "${ZIP_OK:-}" "${ZIP_ATTEMPTED:-}" "${ZIP_VERIFY:-}" "${ZIP_BUILD_TIME:-n/a}")"$'\n'
+        RESULTS+="$(bash_state "GNU Bash" "${WEAPONX_OK:-}" "${BASH_ATTEMPTED:-}" "${BASH_VERIFY:-}" "${BASH_BUILD_TIME:-n/a}")"$'\\n'
+        RESULTS+="$(bash_state "inotifywait" "${INOTIFYWAIT_OK:-}" "${INOTIFY_ATTEMPTED:-}" "${INOTIFY_VERIFY:-}" "${INOTIFY_BUILD_TIME:-n/a}")"$'\\n'
+        RESULTS+="$(bash_state "inotifywatch" "${INOTIFYWATCH_OK:-}" "${INOTIFY_ATTEMPTED:-}" "${INOTIFY_VERIFY:-}" "${INOTIFY_BUILD_TIME:-n/a}")"$'\\n'
+        RESULTS+="$(bash_state "jq" "${JQ_OK:-}" "${JQ_ATTEMPTED:-}" "${JQ_VERIFY:-}" "${JQ_BUILD_TIME:-n/a}")"$'\\n'
+        RESULTS+="$(bash_state "zip" "${ZIP_OK:-}" "${ZIP_ATTEMPTED:-}" "${ZIP_VERIFY:-}" "${ZIP_BUILD_TIME:-n/a}")"$'\\n'
         RESULTS+="$(bash_state "abx" "${ABX_OK:-}" "${ABX_ATTEMPTED:-}" "${ABX_VERIFY:-}" "${ABX_BUILD_TIME:-n/a}")"
 
         if [ "${{ job.status }}" = "success" ]; then
@@ -570,7 +577,7 @@ jobs:
             "rich_message": {
               "blocks": [
                 { "type": "heading", "text": "✅ Android ARM64 Static Toolkit", "size": 1 },
-                { "type": "paragraph", "text": "Status: Success\nTrigger: ${TRIGGER_TYPE}\nDate: ${BUILD_DATE}\nTime: ${BUILD_TIME}" },
+                { "type": "paragraph", "text": "Status: Success\\nTrigger: ${TRIGGER_TYPE}\\nDate: ${BUILD_DATE}\\nTime: ${BUILD_TIME}" },
                 { "type": "divider" },
                 { "type": "heading", "text": "📦 Binaries Built", "size": 2 },
                 {
@@ -686,7 +693,7 @@ jobs:
             cat > /tmp/fallback_payload.json <<EOF
           {
             "chat_id": "${CHAT_ID}",
-            "text": "✅ <b>Android ARM64 Static Toolkit</b>\n<b>Status:</b> Success\n<b>Trigger:</b> ${TRIGGER_TYPE}\n<b>Date:</b> ${BUILD_DATE}\n<b>Time:</b> ${BUILD_TIME}\n<b>Build duration:</b> ${DURATION}\n\n<a href=\"${RELEASE_URL}\">Release 📦</a> | <a href=\"${GITLAB_RELEASE_URL}\">GitLab 📦</a> | <a href=\"${LOGS_URL}\">Logs 📋</a> | <a href=\"${REPO_URL}\">Repo 🏠</a>",
+            "text": "✅ <b>Android ARM64 Static Toolkit</b>\\n<b>Status:</b> Success\\n<b>Trigger:</b> ${TRIGGER_TYPE}\\n<b>Date:</b> ${BUILD_DATE}\\n<b>Time:</b> ${BUILD_TIME}\\n<b>Build duration:</b> ${DURATION}\\n\\n<a href=\\"${RELEASE_URL}\\">Release 📦</a> | <a href=\\"${GITLAB_RELEASE_URL}\\">GitLab 📦</a> | <a href=\\"${LOGS_URL}\\">Logs 📋</a> | <a href=\\"${REPO_URL}\\">Repo 🏠</a>",
             "parse_mode": "HTML",
             "disable_web_page_preview": true
           }
