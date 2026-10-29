@@ -3,32 +3,54 @@ name: Cleanup
 on:
   workflow_dispatch:
     inputs:
+      cleanup:
+        description: 'What to clean'
+        type: choice
+        required: true
+        default: actions
+        options:
+          - actions
+          - releases
+          - both
       repo:
         description: 'Repo'
         required: false
         default: 'RipperHybrid/CI'
       run_id:
-        description: 'Run ID'
+        description: 'Run ID (actions/both only)'
         required: false
         default: ''
       branch:
-        description: 'Branch'
+        description: 'Branch (actions/both only)'
         required: false
         default: 'Master'
       keep:
-        description: 'Runs to keep'
+        description: 'Runs to keep (actions/both only)'
         required: false
         default: '2'
+      releases_to_delete:
+        description: 'Delete this many OLDEST releases (releases/both only; empty=none, -1=all)'
+        required: false
+        default: ''
+      delete_tags:
+        description: 'Also delete git tag (releases/both only)'
+        type: choice
+        required: true
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
   actions: write
-  contents: read
+  contents: write
 
 jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
       - name: Purge old workflow runs
+        if: ${{ inputs.cleanup == 'actions' || inputs.cleanup == 'both' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GHTOKEN }}
@@ -135,4 +157,92 @@ jobs:
               .addRaw(`Branch filter: ${branch || 'all'} • Keep per workflow: ${keep} • Deleted: ${deleted}`)
               .addSeparator()
               .addRaw(lines.join('\n'))
+              .write();
+
+      - name: Purge old releases (oldest first)
+        if: ${{ inputs.cleanup == 'releases' || inputs.cleanup == 'both' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GHTOKEN }}
+          script: |
+            const inputs = context.payload.inputs || {};
+            const raw = (inputs.releases_to_delete || '').trim();
+            const doTags = String(inputs.delete_tags ?? 'true').toLowerCase() !== 'false';
+
+            if (raw === '') {
+              core.info('releases_to_delete is empty — nothing to delete.');
+              return;
+            }
+            const want = parseInt(raw, 10);
+            if (isNaN(want)) {
+              core.setFailed(`releases_to_delete must be an integer, got "${raw}"`);
+              return;
+            }
+
+            try {
+              const me = await github.rest.users.getAuthenticated();
+              core.info(`Authenticated as: ${me.data.login} (${me.data.type})`);
+            } catch (e) {
+              core.setFailed(`GHTOKEN secret is missing or invalid: ${e.message}`);
+              return;
+            }
+
+            let target = (inputs.repo || '').trim()
+              .replace(/^https?:\/\/github\.com\//i, '')
+              .replace(/\.git$/i, '')
+              .replace(/^\/+|\/+$/g, '');
+            let owner, repo;
+            if (target && target.includes('/')) {
+              [owner, repo] = target.split('/').slice(0, 2);
+            } else {
+              ({ owner, repo } = context.repo);
+            }
+
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 }
+            );
+            core.info(`Found ${releases.length} releases in ${owner}/${repo}`);
+
+            let toDelete;
+            if (want === -1) {
+              toDelete = releases.slice();
+            } else if (want <= 0) {
+              core.info(`releases_to_delete=${want} — nothing to delete.`);
+              return;
+            } else {
+              const oldestFirst = releases.slice().reverse();
+              toDelete = oldestFirst.slice(0, want);
+            }
+
+            let deleted = 0;
+            const lines = [];
+            for (const rel of toDelete) {
+              try {
+                await github.rest.repos.deleteRelease({
+                  owner, repo, release_id: rel.id
+                });
+                let tagMsg = '';
+                if (doTags && rel.tag_name) {
+                  try {
+                    await github.rest.git.deleteRef({
+                      owner, repo, ref: `tags/${rel.tag_name}`
+                    });
+                    tagMsg = ' + tag';
+                  } catch (e) {
+                    tagMsg = ` (tag delete failed: ${e.message})`;
+                  }
+                }
+                deleted++;
+                lines.push(`- 🗑️ deleted release ${rel.tag_name} (${rel.created_at})${tagMsg}`);
+              } catch (e) {
+                lines.push(`- ⚠️ failed to delete ${rel.tag_name}: ${e.message}`);
+              }
+            }
+
+            await core.summary
+              .addHeading(`Release cleanup — ${owner}/${repo}`)
+              .addRaw(`Requested: ${want} • Delete tags: ${doTags} • Deleted: ${deleted} (oldest first)`)
+              .addSeparator()
+              .addRaw(lines.join('\n') || 'Nothing matched.')
               .write();
