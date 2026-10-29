@@ -57,12 +57,19 @@ def gh_output(key, value):
 
 def cmd_metadata(args):
     run_number = os.environ["GITHUB_RUN_NUMBER"]
-    version = f"V{run_number}"
-    commit_hash = sh("git rev-parse --short HEAD")
+    commit_hash = sh("git rev-parse HEAD")
+    commit_short = sh("git rev-parse --short HEAD")
     commit_count = sh("git rev-list --count HEAD")
     if not commit_count.isdigit():
         commit_count = run_number
     owner = os.environ["GITHUB_REPOSITORY_OWNER"]
+
+    target_commit = os.environ.get("TARGET_COMMIT", "").strip()
+    if target_commit and target_commit != commit_hash and not commit_hash.startswith(target_commit):
+        prefix = "P"
+    else:
+        prefix = "C"
+    version = f"{prefix}{run_number}"
 
     with open(args.module_prop) as f:
         lines = f.read().splitlines()
@@ -80,7 +87,7 @@ def cmd_metadata(args):
         f.write("\n".join(out) + "\n")
 
     gh_output("version", version)
-    gh_output("filename", f"{args.prefix}_{version}_{commit_hash}_by_{owner}.zip")
+    gh_output("filename", f"{args.prefix}_{version}_{commit_short}_by_{owner}.zip")
 
 
 def read_template(args, kind):

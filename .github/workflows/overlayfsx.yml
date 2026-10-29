@@ -55,6 +55,8 @@ jobs:
       - name: Metadata
         id: metadata
         working-directory: src
+        env:
+          TARGET_COMMIT: ${{ env.TARGET_COMMIT }}
         run: |
           PROP_FILE=$(find . -type f -name "module.prop" ! -path "*/target/*" | head -n 1)
           [ -z "$PROP_FILE" ] && { echo "module.prop not found"; exit 1; }

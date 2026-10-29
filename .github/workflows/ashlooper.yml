@@ -55,6 +55,8 @@ jobs:
       - name: Metadata
         id: metadata
         working-directory: src
+        env:
+          TARGET_COMMIT: ${{ env.TARGET_COMMIT }}
         run: python3 ../release.py metadata --module-prop module.prop --prefix AshLooper
 
       - name: Run Vite
