@@ -29,7 +29,7 @@ on:
         required: false
         default: '2'
       releases_to_delete:
-        description: 'Delete this many OLDEST releases (releases/both only; empty=none, -1=all)'
+        description: 'Delete releases: X = oldest, +X = newest, -1 = all'
         required: false
         default: ''
       delete_tags:
@@ -205,11 +205,16 @@ jobs:
             core.info(`Found ${releases.length} releases in ${owner}/${repo}`);
 
             let toDelete;
+            let orderLabel = 'oldest first';
             if (want === -1) {
               toDelete = releases.slice();
+              orderLabel = 'all';
             } else if (want <= 0) {
               core.info(`releases_to_delete=${want} — nothing to delete.`);
               return;
+            } else if (raw.startsWith('+')) {
+              toDelete = releases.slice(0, want);
+              orderLabel = 'newest first';
             } else {
               const oldestFirst = releases.slice().reverse();
               toDelete = oldestFirst.slice(0, want);
@@ -242,7 +247,7 @@ jobs:
 
             await core.summary
               .addHeading(`Release cleanup — ${owner}/${repo}`)
-              .addRaw(`Requested: ${want} • Delete tags: ${doTags} • Deleted: ${deleted} (oldest first)`)
+              .addRaw(`Requested: ${raw} • Delete tags: ${doTags} • Deleted: ${deleted} (${orderLabel})`)
               .addSeparator()
               .addRaw(lines.join('\n') || 'Nothing matched.')
               .write();

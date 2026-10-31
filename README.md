@@ -20,12 +20,15 @@ Finished runs get deleted, so the Actions tab stays empty on purpose.
 
 The **Cleanup** workflow can be run by hand from the Actions tab to purge old runs from this repo or any other. Inputs:
 
-| Input | Default | Meaning |
-| --- | --- | --- |
-| `repo` | `RipperHybrid/CI` | Repo to clean. Leave empty for this repo. |
-| `run_id` | *(latest)* | Run to wait for before cleaning. |
-| `branch` | `Master` | Only clean runs of this branch. Empty = all. |
-| `keep` | `2` | Runs to keep per workflow. `0` deletes everything completed. |
+| Input | Default | Target | Meaning |
+| --- | --- | --- | --- |
+| `cleanup` | `actions` | **All** | What to clean (`actions`, `releases`, or `both`). |
+| `repo` | `RipperHybrid/CI` | **All** | Repo to clean. Leave empty for this repo. |
+| `run_id` | *(latest)* | **Actions** | Run to wait for before cleaning. |
+| `branch` | `Master` | **Actions** | Only clean runs of this branch. Empty = all. |
+| `keep` | `2` | **Actions** | Runs to keep per workflow. `0` deletes everything completed. |
+| `releases_to_delete` | *(empty)* | **Releases** | Delete releases: `X` = oldest, `+X` = newest, `-1` = all. |
+| `delete_tags` | `true` | **Releases** | Also delete the associated git tags. |
 
 It never deletes itself and skips running runs. Builds trigger it automatically with `CLEANUP_KEEP=0`, so nothing survives a build except the cleanup run.
 
