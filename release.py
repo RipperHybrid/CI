@@ -210,47 +210,54 @@ def cmd_publish(args):
     if args.status != "success":
         title = f"[FAILED] {title}"
 
-    subprocess.run(
-        ["gh", "release", "delete", tag, "--repo", args.source_repo, "--cleanup-tag", "-y"],
-        capture_output=True,
-    )
-    release = subprocess.run(
-        ["gh", "release", "create", tag, *files,
-         "--repo", args.source_repo, "--target", sha,
-         "--title", title, "--notes-file", "/tmp/notes.md"],
-        capture_output=True, text=True,
-    )
-    if release.returncode != 0:
-        print(f"release failed: {release.stderr.strip()}", file=sys.stderr)
+    try:
+        subprocess.run(
+            ["gh", "release", "delete", tag, "--repo", args.source_repo, "--cleanup-tag", "-y"],
+            capture_output=True,
+        )
+        release = subprocess.run(
+            ["gh", "release", "create", tag, *files,
+             "--repo", args.source_repo, "--target", sha,
+             "--title", title, "--notes-file", "/tmp/notes.md"],
+            capture_output=True, text=True,
+        )
+        if release.returncode != 0:
+            print(f"release failed: {release.stderr.strip()}", file=sys.stderr)
 
-    bot_token = os.environ.get("BOT_TOKEN")
-    chat_id = os.environ.get("CHAT_ID")
-    if bot_token and chat_id and args.zip and os.path.isfile(args.zip):
-        repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{args.source_repo}"
-        keyboard = resolve_buttons(args, repo_url, tag)
-        send_telegram(bot_token, chat_id, args.zip, keyboard)
-
-    cleanup_workflow = os.path.join(
-        os.environ.get("GITHUB_WORKSPACE", "."), ".github", "workflows", "cleanup.yml"
-    )
-    if not os.path.exists(cleanup_workflow):
-        print("cleanup.yml not found skipping run cleanup", file=sys.stderr)
-    else:
-        repo = os.environ["GITHUB_REPOSITORY"]
-        dispatch = [
-            "gh", "workflow", "run", "cleanup.yml",
-            "--repo", repo,
-            "-f", f"repo={repo}",
-            "-f", f"run_id={os.environ['GITHUB_RUN_ID']}",
-        ]
-        if args.cleanup_keep:
-            dispatch += ["-f", f"keep={args.cleanup_keep}"]
-        ref = os.environ.get("GITHUB_REF_NAME")
-        if ref:
-            dispatch += ["-f", f"branch={ref}"]
-        cleanup = subprocess.run(dispatch, capture_output=True, text=True)
-        if cleanup.returncode != 0:
-            print(f"cleanup dispatch failed (build unaffected): {cleanup.stderr.strip()}", file=sys.stderr)
+        bot_token = os.environ.get("BOT_TOKEN")
+        chat_id = os.environ.get("CHAT_ID")
+        if bot_token and chat_id and args.zip and os.path.isfile(args.zip):
+            repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{args.source_repo}"
+            keyboard = resolve_buttons(args, repo_url, tag)
+            send_telegram(bot_token, chat_id, args.zip, keyboard)
+    except Exception as e:
+        print(f"publish step raised: {e}", file=sys.stderr)
+        release = subprocess.CompletedProcess(args=[], returncode=1)
+    finally:
+        cleanup_workflow = os.path.join(
+            os.environ.get("GITHUB_WORKSPACE", "."), ".github", "workflows", "cleanup.yml"
+        )
+        if not os.path.exists(cleanup_workflow):
+            print("cleanup.yml not found skipping run cleanup", file=sys.stderr)
+        else:
+            repo = os.environ["GITHUB_REPOSITORY"]
+            dispatch = [
+                "gh", "workflow", "run", "cleanup.yml",
+                "--repo", repo,
+                "-f", f"repo={repo}",
+                "-f", f"run_id={os.environ['GITHUB_RUN_ID']}",
+            ]
+            if args.cleanup_keep:
+                dispatch += ["-f", f"keep={args.cleanup_keep}"]
+            ref = os.environ.get("GITHUB_REF_NAME")
+            if ref:
+                dispatch += ["-f", f"branch={ref}"]
+            try:
+                cleanup = subprocess.run(dispatch, capture_output=True, text=True)
+                if cleanup.returncode != 0:
+                    print(f"cleanup dispatch failed (build unaffected): {cleanup.stderr.strip()}", file=sys.stderr)
+            except Exception as e:
+                print(f"cleanup dispatch raised: {e}", file=sys.stderr)
 
     sys.exit(1 if release.returncode != 0 else 0)
 
