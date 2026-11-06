@@ -64,8 +64,21 @@ def cmd_metadata(args):
         commit_count = run_number
     owner = os.environ["GITHUB_REPOSITORY_OWNER"]
 
+    branch = os.environ.get("TARGET_BRANCH", "").strip()
+    branch_tip = ""
+    if branch:
+        try:
+            out = subprocess.run(
+                ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+                capture_output=True, text=True, check=True, timeout=10,
+            ).stdout.strip()
+            if out:
+                branch_tip = out.split()[0]
+        except Exception:
+            branch_tip = ""
+
     target_commit = os.environ.get("TARGET_COMMIT", "").strip()
-    if target_commit and target_commit != commit_hash and not commit_hash.startswith(target_commit):
+    if branch_tip and branch_tip != commit_hash or (target_commit and target_commit != commit_hash and not commit_hash.startswith(target_commit)):
         prefix = "P"
     else:
         prefix = "C"
