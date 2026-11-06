@@ -28,7 +28,6 @@ env:
   TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'Exfsx' }}
   TARGET_COMMIT: ${{ github.event.inputs.target_commit || '' }}
   CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
-  LOG: /tmp/build.log
 
 jobs:
   build:
@@ -70,11 +69,9 @@ jobs:
       - name: Setup Rust
         working-directory: src
         run: |
-          {
-            rustup update stable
-            rustup target add aarch64-linux-android
-            rustup target add x86_64-linux-android
-          } 2>&1 | tee -a "$LOG"
+          rustup update stable
+          rustup target add aarch64-linux-android
+          rustup target add x86_64-linux-android
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -84,19 +81,19 @@ jobs:
 
       - name: Install cross
         working-directory: src
-        run: cargo install cross --git https://github.com/cross-rs/cross 2>&1 | tee -a "$LOG"
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build
         working-directory: src
         run: |
           chmod +x build.sh
-          ./build.sh 2>&1 | tee -a "$LOG"
+          ./build.sh
 
       - name: Create Zip
         working-directory: src
         run: |
           cd target/module
-          zip -r "../../../${{ steps.metadata.outputs.filename }}" . 2>&1 | tee -a "$LOG"
+          zip -r "../../../${{ steps.metadata.outputs.filename }}" .
 
       - name: Publish
         if: always()
@@ -113,6 +110,5 @@ jobs:
             --version "${{ steps.metadata.outputs.version }}" \
             --status "${{ job.status }}" \
             --zip "../${{ steps.metadata.outputs.filename }}" \
-            --log "$LOG" \
             --cleanup-keep "$CLEANUP_KEEP" \
             --start-ts-file /tmp/build_start_ts

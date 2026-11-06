@@ -28,7 +28,6 @@ env:
   TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'ExCraft' }}
   TARGET_COMMIT: ${{ github.event.inputs.target_commit || '' }}
   CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
-  LOG: /tmp/build.log
 
 jobs:
   build:
@@ -67,34 +66,32 @@ jobs:
       - name: Build
         working-directory: src
         run: |
-          {
-            if [ -f "webroot/package.json" ]; then
-              cd webroot
-              npm install
-              npm run build
-              [ -d "cgi-bin" ] && cp -r cgi-bin dist/
-              cd ..
-            fi
+          if [ -f "webroot/package.json" ]; then
+            cd webroot
+            npm install
+            npm run build
+            [ -d "cgi-bin" ] && cp -r cgi-bin dist/
+            cd ..
+          fi
 
-            mkdir -p Template_Build
-            cp -r binaries META-INF action.sh module.prop monitor.sh service.sh utils.sh uninstall.sh Template_Build/
-            if [ -d "webroot/dist" ]; then cp -r webroot/dist Template_Build/webroot
-            elif [ -d "webroot" ]; then cp -r webroot Template_Build/; fi
-            (cd Template_Build && zip -r ../template.zip .)
-            mkdir -p Template
-            mv template.zip Template/
+          mkdir -p Template_Build
+          cp -r binaries META-INF action.sh module.prop monitor.sh service.sh utils.sh uninstall.sh Template_Build/
+          if [ -d "webroot/dist" ]; then cp -r webroot/dist Template_Build/webroot
+          elif [ -d "webroot" ]; then cp -r webroot Template_Build/; fi
+          (cd Template_Build && zip -r ../template.zip .)
+          mkdir -p Template
+          mv template.zip Template/
 
-            mkdir -p Master_Staging
-            cp -r binaries META-INF Template action.sh customize.sh utils.sh monitor.sh module.prop service.sh uninstall.sh Master_Staging/
-            if [ -d "webroot/dist" ]; then cp -r webroot/dist Master_Staging/webroot
-            elif [ -d "webroot" ]; then cp -r webroot Master_Staging/; fi
-          } 2>&1 | tee -a "$LOG"
+          mkdir -p Master_Staging
+          cp -r binaries META-INF Template action.sh customize.sh utils.sh monitor.sh module.prop service.sh uninstall.sh Master_Staging/
+          if [ -d "webroot/dist" ]; then cp -r webroot/dist Master_Staging/webroot
+          elif [ -d "webroot" ]; then cp -r webroot Master_Staging/; fi
 
       - name: Create Zip
         working-directory: src
         run: |
           cd Master_Staging
-          zip -r "../../${{ steps.metadata.outputs.filename }}" . 2>&1 | tee -a "$LOG"
+          zip -r "../../${{ steps.metadata.outputs.filename }}" .
 
       - name: Publish
         if: always()
@@ -111,6 +108,5 @@ jobs:
             --version "${{ steps.metadata.outputs.version }}" \
             --status "${{ job.status }}" \
             --zip "../${{ steps.metadata.outputs.filename }}" \
-            --log "$LOG" \
             --cleanup-keep "$CLEANUP_KEEP" \
             --start-ts-file /tmp/build_start_ts

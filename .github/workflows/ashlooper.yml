@@ -28,7 +28,6 @@ env:
   TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'ExLooper' }}
   TARGET_COMMIT: ${{ github.event.inputs.target_commit || '' }}
   CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
-  LOG: /tmp/build.log
 
 jobs:
   build:
@@ -62,21 +61,19 @@ jobs:
       - name: Run Vite
         working-directory: src
         run: |
-          {
-            if [ -f "package.json" ]; then
-              if grep -q '"vite"' package.json || ls vite.config.* 1> /dev/null 2>&1; then
-                npm install
-                npx vite build
-              fi
+          if [ -f "package.json" ]; then
+            if grep -q '"vite"' package.json || ls vite.config.* 1> /dev/null 2>&1; then
+              npm install
+              npx vite build
             fi
-          } 2>&1 | tee -a "$LOG"
+          fi
 
       - name: Create Zip
         working-directory: src
         run: |
           zip -r "../${{ steps.metadata.outputs.filename }}" \
           bin META-INF webroot action.sh customize.sh utils.sh monitor.sh \
-          module.prop post-fs-data.sh service.sh settings.prop uninstall.sh 2>&1 | tee -a "$LOG"
+          module.prop post-fs-data.sh service.sh settings.prop uninstall.sh
 
       - name: Publish
         if: always()
@@ -93,6 +90,5 @@ jobs:
             --version "${{ steps.metadata.outputs.version }}" \
             --status "${{ job.status }}" \
             --zip "../${{ steps.metadata.outputs.filename }}" \
-            --log "$LOG" \
             --cleanup-keep "$CLEANUP_KEEP" \
             --start-ts-file /tmp/build_start_ts

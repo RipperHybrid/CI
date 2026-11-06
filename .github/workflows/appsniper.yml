@@ -28,7 +28,6 @@ env:
   TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'Master' }}
   TARGET_COMMIT: ${{ github.event.inputs.target_commit || '' }}
   CLEANUP_KEEP: ${{ github.event.inputs.cleanup_keep || '0' }}
-  LOG: /tmp/build.log
 
 jobs:
   build:
@@ -63,7 +62,7 @@ jobs:
         working-directory: src
         run: |
           zip -r "../${{ steps.metadata.outputs.filename }}" \
-          bin config webroot customize.sh module.prop service.sh uninstall.sh utils.sh 2>&1 | tee -a "$LOG"
+          bin config webroot customize.sh module.prop service.sh uninstall.sh utils.sh
 
       - name: Publish
         if: always()
@@ -80,6 +79,5 @@ jobs:
             --version "${{ steps.metadata.outputs.version }}" \
             --status "${{ job.status }}" \
             --zip "../${{ steps.metadata.outputs.filename }}" \
-            --log "$LOG" \
             --cleanup-keep "$CLEANUP_KEEP" \
             --start-ts-file /tmp/build_start_ts

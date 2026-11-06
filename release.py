@@ -190,15 +190,8 @@ def cmd_publish(args):
     sha = sh("git rev-parse HEAD")
 
     files = []
-    has_log = False
-    if args.zip and os.path.exists(args.zip):
+    if args.zip and os.path.isfile(args.zip):
         files.append(args.zip)
-    if args.log and os.path.exists(args.log):
-        log_copy = f"/tmp/{tag}.log"
-        with open(args.log) as src, open(log_copy, "w") as dst:
-            dst.write(src.read())
-        files.append(log_copy)
-        has_log = True
 
     title = f"{display_name} #{run_number}"
     if args.status != "success":
@@ -219,7 +212,7 @@ def cmd_publish(args):
 
     bot_token = os.environ.get("BOT_TOKEN")
     chat_id = os.environ.get("CHAT_ID")
-    if bot_token and chat_id and args.zip and os.path.exists(args.zip):
+    if bot_token and chat_id and args.zip and os.path.isfile(args.zip):
         repo_url = f"{os.environ['GITHUB_SERVER_URL']}/{args.source_repo}"
         keyboard = resolve_buttons(args, repo_url, tag)
         send_telegram(bot_token, chat_id, args.zip, keyboard)
@@ -265,7 +258,6 @@ def main():
     p_pub.add_argument("--version", default="")
     p_pub.add_argument("--status", required=True)
     p_pub.add_argument("--zip", default="")
-    p_pub.add_argument("--log", default="")
     p_pub.add_argument("--cleanup-keep", default="")
     p_pub.add_argument("--start-ts-file", default="")
     p_pub.add_argument("--msg", default="")
