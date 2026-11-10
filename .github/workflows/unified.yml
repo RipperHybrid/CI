@@ -1,0 +1,233 @@
+name: Unified CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Source Repo'
+        type: choice
+        required: true
+        default: 'RipperHybrid/sbx'
+        options:
+          - RipperHybrid/AppSniper
+          - RipperHybrid/sbx
+          - RipperHybrid/custom
+      branch:
+        description: 'Branch'
+        type: choice
+        required: true
+        default: 'ExLooper'
+        options:
+          - ExBlocker
+          - ExLooper
+          - ExCraft
+          - Exfsx
+          - Master
+          - custom
+      custom_repo:
+        description: 'For repo=custom only'
+        required: false
+        default: ''
+      custom_branch:
+        description: 'For branch=custom only'
+        required: false
+        default: ''
+      target_commit:
+        description: 'SHA (overrides branch)'
+        required: false
+        default: ''
+      cleanup_keep:
+        description: 'Runs to keep'
+        required: false
+        default: '0'
+      prefix:
+        description: 'Name (default: module.prop name)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.repo }}" = "RipperHybrid/custom" ]; then
+            REPO="${{ inputs.custom_repo }}"
+            if [ -z "$REPO" ]; then
+              echo "::error::repo=custom selected but custom_repo is empty"
+              exit 1
+            fi
+          else
+            REPO="${{ inputs.repo }}"
+          fi
+
+          if [ "${{ inputs.branch }}" = "custom" ]; then
+            BRANCH="${{ inputs.custom_branch }}"
+            if [ -z "$BRANCH" ]; then
+              echo "::error::branch=custom selected but custom_branch is empty"
+              exit 1
+            fi
+          else
+            BRANCH="${{ inputs.branch }}"
+          fi
+
+          echo "SOURCE_REPO=$REPO" >> "$GITHUB_ENV"
+          echo "TARGET_BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          echo "PREFIX=${{ inputs.prefix }}" >> "$GITHUB_ENV"
+          echo "repo:   $REPO"
+          echo "branch: $BRANCH"
+          echo "prefix: ${{ inputs.prefix }}"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.target_commit != '' && inputs.target_commit || env.TARGET_BRANCH }}
+          token: ${{ secrets.GHTOKEN }}
+          fetch-depth: 0
+          path: src
+
+      - name: Start timer
+        run: date +%s > /tmp/build_start_ts
+
+      - name: Metadata
+        id: metadata
+        working-directory: src
+        env:
+          TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
+          TARGET_COMMIT: ${{ inputs.target_commit }}
+        run: |
+          PROP_FILE=$(find . -type f -name "module.prop" ! -path "*/target/*" | head -n 1)
+          if [ -z "$PROP_FILE" ]; then
+            echo "::error::module.prop not found"
+            exit 1
+          fi
+          python3 ../release.py metadata --module-prop "$PROP_FILE" --prefix "${PREFIX}"
+
+      - name: Pre-build hook
+        if: hashFiles('src/.github/build.sh') != ''
+        working-directory: src
+        run: |
+          chmod +x .github/build.sh
+          ./.github/build.sh
+
+      - name: Build ZIP
+        working-directory: src
+        run: |
+          set -euo pipefail
+
+          ZIP_NAME="${{ steps.metadata.outputs.filename }}"
+          OUT_ZIP="../${ZIP_NAME}"
+          STAGE="$(mktemp -d)"
+          echo "Staging: $STAGE"
+
+          FALLBACK=(META-INF webroot customize.sh post-fs-data.sh module.prop uninstall.sh service.sh)
+
+          if [ -d ".github/_stage" ]; then
+            echo "-> Using .github/_stage (build.sh output)"
+            cp -a .github/_stage/. "$STAGE/"
+            ( cd "$STAGE" && zip -r -q "$OLDPWD/$OUT_ZIP" . )
+            echo "ZIP: $OUT_ZIP ($(du -h "$OUT_ZIP" | cut -f1))"
+            exit 0
+          fi
+
+          PACK_LIST=()
+          if [ -f ".github/pack.txt" ]; then
+            echo "-> Using .github/pack.txt"
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              [ -z "$line" ] && continue
+              case "$line" in
+                \#*) continue ;;
+              esac
+              PACK_LIST+=("$line")
+            done < .github/pack.txt
+          else
+            echo "-> No .github/pack.txt, using fallback list"
+            PACK_LIST=("${FALLBACK[@]}")
+          fi
+
+          if [ ${#PACK_LIST[@]} -eq 0 ]; then
+            echo "::error::pack list is empty"
+            exit 1
+          fi
+
+          echo "Pack entries (${#PACK_LIST[@]}):"
+          printf '  - %s\n' "${PACK_LIST[@]}"
+
+          MISSING=()
+          COPIED=()
+          for entry in "${PACK_LIST[@]}"; do
+            case "$entry" in
+              /*|..|../*|*/..|*/../*)
+                echo "::warning::skipping unsafe path '$entry'"
+                MISSING+=("$entry")
+                continue
+                ;;
+            esac
+
+            if [ -e "$entry" ]; then
+              mkdir -p "$STAGE/$(dirname "$entry")"
+              cp -a "$entry" "$STAGE/"
+              COPIED+=("$entry")
+            else
+              echo "::warning::missing '$entry' (skipping)"
+              MISSING+=("$entry")
+            fi
+          done
+
+          if [ ${#COPIED[@]} -eq 0 ]; then
+            echo "::error::none of the pack entries exist — refusing to publish empty zip"
+            printf '  - %s\n' "${PACK_LIST[@]}"
+            exit 1
+          fi
+
+          echo ""
+          echo "Copied ${#COPIED[@]} / ${#PACK_LIST[@]} entries."
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "Missing (skipped): ${MISSING[*]}"
+          fi
+
+          ( cd "$STAGE" && zip -r -q "$OLDPWD/$OUT_ZIP" . )
+          echo "ZIP: $OUT_ZIP ($(du -h "$OUT_ZIP" | cut -f1))"
+
+      - name: Publish
+        if: always()
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TEST_BUILDS }}
+          TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
+          TARGET_COMMIT: ${{ inputs.target_commit }}
+        run: |
+          ZIP_ARG=""
+          if [ -f "../${{ steps.metadata.outputs.filename }}" ]; then
+            ZIP_ARG="--zip ../${{ steps.metadata.outputs.filename }}"
+          fi
+          NAME="${PREFIX}"
+          if [ -z "$NAME" ]; then
+            NAME="${{ steps.metadata.outputs.name }}"
+          fi
+          python3 ../release.py publish \
+            --source-repo "${SOURCE_REPO}" \
+            --branch "${TARGET_BRANCH}" \
+            --name "${NAME}" \
+            --version "${{ steps.metadata.outputs.version }}" \
+            --status "${{ job.status }}" \
+            ${ZIP_ARG} \
+            --cleanup-keep "${{ inputs.cleanup_keep }}" \
+            --start-ts-file /tmp/build_start_ts

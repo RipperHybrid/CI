@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone, timedelta
 
 
 DEFAULT_HTML = (
@@ -55,6 +56,24 @@ def gh_output(key, value):
             f.write(f"{key}={value}\n")
 
 
+def ist_version_code():
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(ist)
+    hour12 = now.hour % 12 or 12
+    return f"{hour12:02d}{now.minute:02d}{now.day:02d}"
+
+
+def read_module_name(prop_path):
+    try:
+        with open(prop_path) as f:
+            for line in f:
+                if line.startswith("name="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
 def cmd_metadata(args):
     run_number = os.environ["GITHUB_RUN_NUMBER"]
     commit_hash = sh("git rev-parse HEAD")
@@ -78,11 +97,22 @@ def cmd_metadata(args):
             branch_tip = ""
 
     target_commit = os.environ.get("TARGET_COMMIT", "").strip()
-    if branch_tip and branch_tip != commit_hash or (target_commit and target_commit != commit_hash and not commit_hash.startswith(target_commit)):
-        prefix = "P"
+    is_sha_build = bool(
+        (branch_tip and branch_tip != commit_hash)
+        or (target_commit and target_commit != commit_hash and not commit_hash.startswith(target_commit))
+    )
+
+    if is_sha_build:
+        version = f"P{int(commit_count) - 1}"
     else:
-        prefix = "C"
-    version = f"{prefix}{run_number}"
+        version = f"C{commit_count}"
+
+    version_code = ist_version_code()
+
+    prefix = args.prefix.strip()
+    if not prefix:
+        module_name = read_module_name(args.module_prop)
+        prefix = slugify(module_name) if module_name else "module"
 
     with open(args.module_prop) as f:
         lines = f.read().splitlines()
@@ -92,15 +122,16 @@ def cmd_metadata(args):
         if line.startswith("version="):
             out.append(f"version={version}")
         elif line.startswith("versionCode="):
-            out.append(f"versionCode={commit_count}")
+            out.append(f"versionCode={version_code}")
         else:
             out.append(line)
 
     with open(args.module_prop, "w") as f:
         f.write("\n".join(out) + "\n")
 
+    gh_output("name", prefix)
     gh_output("version", version)
-    gh_output("filename", f"{args.prefix}_{version}_{commit_short}_by_{owner}.zip")
+    gh_output("filename", f"{prefix}_{version}_{commit_short}_by_{owner}.zip")
 
 
 def read_template(args, kind):
@@ -268,7 +299,7 @@ def main():
 
     p_meta = sub.add_parser("metadata")
     p_meta.add_argument("--module-prop", required=True)
-    p_meta.add_argument("--prefix", required=True)
+    p_meta.add_argument("--prefix", default="")
     p_meta.set_defaults(func=cmd_metadata)
 
     p_pub = sub.add_parser("publish")
