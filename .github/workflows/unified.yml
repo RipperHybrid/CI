@@ -25,7 +25,7 @@ on:
           - Master
           - custom
       custom_repo:
-        description: 'For repo=custom only'
+        description: 'For repo=custom only (repo name or owner/repo)'
         required: false
         default: ''
       custom_branch:
@@ -44,6 +44,14 @@ on:
         description: 'Name (default: module.prop name)'
         required: false
         default: ''
+      tag:
+        description: 'Build tag'
+        type: choice
+        required: true
+        default: 'dev'
+        options:
+          - dev
+          - release
 
 permissions:
   contents: read
@@ -60,37 +68,56 @@ jobs:
 
       - name: Resolve inputs
         id: resolve
+        env:
+          IN_REPO: ${{ inputs.repo }}
+          IN_CUSTOM_REPO: ${{ inputs.custom_repo }}
+          IN_BRANCH: ${{ inputs.branch }}
+          IN_CUSTOM_BRANCH: ${{ inputs.custom_branch }}
+          IN_PREFIX: ${{ inputs.prefix }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
-          if [ "${{ inputs.repo }}" = "RipperHybrid/custom" ]; then
-            REPO="${{ inputs.custom_repo }}"
+          if [ "$IN_REPO" = "RipperHybrid/custom" ]; then
+            REPO="$IN_CUSTOM_REPO"
             if [ -z "$REPO" ]; then
               echo "::error::repo=custom selected but custom_repo is empty"
               exit 1
             fi
           else
-            REPO="${{ inputs.repo }}"
+            REPO="$IN_REPO"
           fi
 
-          if [ "${{ inputs.branch }}" = "custom" ]; then
-            BRANCH="${{ inputs.custom_branch }}"
+          REPO="${REPO#https://github.com/}"
+          REPO="${REPO#http://github.com/}"
+          REPO="${REPO%.git}"
+          REPO="${REPO#/}"
+          REPO="${REPO%/}"
+
+          case "$REPO" in
+            */*) ;;
+            *) REPO="${OWNER}/${REPO}" ;;
+          esac
+
+          if [ "$IN_BRANCH" = "custom" ]; then
+            BRANCH="$IN_CUSTOM_BRANCH"
             if [ -z "$BRANCH" ]; then
               echo "::error::branch=custom selected but custom_branch is empty"
               exit 1
             fi
           else
-            BRANCH="${{ inputs.branch }}"
+            BRANCH="$IN_BRANCH"
           fi
 
           echo "SOURCE_REPO=$REPO" >> "$GITHUB_ENV"
           echo "TARGET_BRANCH=$BRANCH" >> "$GITHUB_ENV"
-          echo "PREFIX=${{ inputs.prefix }}" >> "$GITHUB_ENV"
+          echo "PREFIX=$IN_PREFIX" >> "$GITHUB_ENV"
           echo "repo:   $REPO"
           echo "branch: $BRANCH"
-          echo "prefix: ${{ inputs.prefix }}"
+          echo "prefix: $IN_PREFIX"
 
       - name: Checkout source
+        id: src
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
@@ -205,7 +232,7 @@ jobs:
           echo "ZIP: $OUT_ZIP ($(du -h "$OUT_ZIP" | cut -f1))"
 
       - name: Publish
-        if: always()
+        if: ${{ always() && steps.src.outcome == 'success' }}
         working-directory: src
         env:
           GH_TOKEN: ${{ secrets.GHTOKEN }}
@@ -213,6 +240,7 @@ jobs:
           CHAT_ID: ${{ secrets.TEST_BUILDS }}
           TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
           TARGET_COMMIT: ${{ inputs.target_commit }}
+          BUILD_TAG: ${{ inputs.tag }}
         run: |
           ZIP_ARG=""
           if [ -f "../${{ steps.metadata.outputs.filename }}" ]; then
@@ -228,6 +256,7 @@ jobs:
             --name "${NAME}" \
             --version "${{ steps.metadata.outputs.version }}" \
             --status "${{ job.status }}" \
+            --tag "${BUILD_TAG}" \
             ${ZIP_ARG} \
             --cleanup-keep "${{ inputs.cleanup_keep }}" \
             --start-ts-file /tmp/build_start_ts

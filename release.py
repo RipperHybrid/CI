@@ -13,7 +13,7 @@ DEFAULT_HTML = (
     "Run from: {ci_name} (#{run_number})\n"
     "Commit No: {commit_no}\n"
     "Hash: {commit_short}\n\n"
-    "☢️ Dev Build\n\n"
+    "{build_label}\n\n"
     "<pre>Commit\n{commit_msg}</pre>\n"
     "Version: {version}\n"
     "Build Time: {runtime}\n"
@@ -24,7 +24,7 @@ DEFAULT_MD = (
     "Run from: {ci_name} (#{run_number})\n"
     "Commit No: {commit_no}\n"
     "Hash: {commit_short}\n\n"
-    "☢️ Dev Build\n\n"
+    "{build_label}\n\n"
     "Commit\n````\n{commit_msg}\n````\n\n"
     "Version: {version}\n"
     "Build Time: {runtime}\n"
@@ -47,6 +47,16 @@ def slugify(s):
             prev_dash = True
     slug = "".join(out).strip("-")
     return slug or "module"
+
+
+def tag_safe(s):
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch in "._-":
+            out.append(ch)
+        else:
+            out.append("-")
+    return "".join(out).strip("-.")
 
 
 def gh_output(key, value):
@@ -145,7 +155,13 @@ def read_template(args, kind):
     return None
 
 
-def compose(template, *, branch, source_repo, version, runtime, run_number, as_html):
+def build_label(tag):
+    if (tag or "").strip().lower() == "release":
+        return "💎 Release Build"
+    return "☢️ Dev Build"
+
+
+def compose(template, *, branch, source_repo, version, runtime, run_number, as_html, tag="dev"):
     repo_name = source_repo.split("/", 1)[1]
     ci_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
     commit_msg = sh("git log -1 --pretty=%B")
@@ -174,6 +190,7 @@ def compose(template, *, branch, source_repo, version, runtime, run_number, as_h
         "commit_hash": commit_hash,
         "version": version or "n/a",
         "runtime": runtime,
+        "build_label": build_label(tag),
     }
     return template.format(**values)
 
@@ -220,24 +237,28 @@ def cmd_publish(args):
 
     notes = compose(md_tpl, branch=args.branch, source_repo=args.source_repo,
                     version=args.version, runtime=runtime,
-                    run_number=run_number, as_html=False)
+                    run_number=run_number, as_html=False, tag=args.tag)
     caption = compose(html_tpl, branch=args.branch, source_repo=args.source_repo,
                       version=args.version, runtime=runtime,
-                      run_number=run_number, as_html=True)
+                      run_number=run_number, as_html=True, tag=args.tag)
 
     with open("/tmp/notes.md", "w") as f:
         f.write(notes)
     with open("/tmp/tg_caption.txt", "w") as f:
         f.write(caption)
 
-    tag = f"{slugify(display_name)}-{run_number}"
+    version_tag = tag_safe(args.version.strip()) if args.version else ""
+    tag = version_tag or f"{slugify(display_name)}-{run_number}"
     sha = sh("git rev-parse HEAD")
 
     files = []
     if args.zip and os.path.isfile(args.zip):
         files.append(args.zip)
 
-    title = f"{display_name} #{run_number}"
+    if args.version:
+        title = f"{display_name} - Version {args.version} Changelog"
+    else:
+        title = f"{display_name} Changelog"
     if args.status != "success":
         title = f"[FAILED] {title}"
 
@@ -308,6 +329,7 @@ def main():
     p_pub.add_argument("--name", default="")
     p_pub.add_argument("--version", default="")
     p_pub.add_argument("--status", required=True)
+    p_pub.add_argument("--tag", default="dev")
     p_pub.add_argument("--zip", default="")
     p_pub.add_argument("--cleanup-keep", default="")
     p_pub.add_argument("--start-ts-file", default="")
