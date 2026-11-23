@@ -10,7 +10,7 @@ on:
       target_branch:
         description: 'Branch'
         required: false
-        default: 'Exfsx'
+        default: 'ExFsx'
       target_commit:
         description: 'Commit SHA (optional, overrides branch)'
         required: false
