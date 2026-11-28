@@ -40,13 +40,261 @@ on:
         options:
           - 'true'
           - 'false'
+      release:
+        description: 'Publish the build release from run_id'
+        type: choice
+        required: false
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   actions: write
   contents: write
 
 jobs:
+  release:
+    if: ${{ inputs.release == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.summary.outputs.ok }}
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - name: Wait for build run
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GHTOKEN }}
+          script: |
+            const inputs = context.payload.inputs || {};
+            const runId = Number(inputs.run_id);
+            if (!runId) {
+              core.setFailed('release=true requires run_id');
+              return;
+            }
+            let target = (inputs.repo || '').trim()
+              .replace(/^https?:\/\/github\.com\//i, '')
+              .replace(/\.git$/i, '')
+              .replace(/^\/+|\/+$/g, '');
+            let owner, repo;
+            if (target && target.includes('/')) {
+              [owner, repo] = target.split('/').slice(0, 2);
+            } else {
+              ({ owner, repo } = context.repo);
+            }
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+            for (let i = 0; i < 60; i++) {
+              const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+              if (data.status === 'completed' && data.conclusion) {
+                core.setOutput('owner', owner);
+                core.setOutput('repo', repo);
+                core.info(`Run ${runId} in ${owner}/${repo} concluded: ${data.conclusion}`);
+                return;
+              }
+              if (i === 0) core.info(`Run ${runId} in ${owner}/${repo} is still running. Checking every 5s for up to 5 min.`);
+              await sleep(5000);
+            }
+            core.setFailed(`Run ${runId} in ${owner}/${repo} did not reach a conclusion within 5 min. Nothing was sent.`);
+
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: build-output
+          run-id: ${{ inputs.run_id }}
+          repository: ${{ inputs.repo }}
+          github-token: ${{ secrets.GHTOKEN }}
+
+      - name: Read build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          META=build-output/metadata.json
+          if [ ! -f "$META" ]; then
+            echo "::error::build-output/metadata.json is missing; cannot publish a deferred release"
+            exit 1
+          fi
+          NAME_VALUE=$(jq -r '.name // ""' "$META")
+          FILENAME=$(jq -r '.filename // ""' "$META")
+          RUN_NUMBER=$(jq -r '.run_number // ""' "$META")
+          STEM="${FILENAME%.zip}"
+          if [ -z "$STEM" ]; then
+            SLUG=$(printf '%s' "$NAME_VALUE" | tr -cs '[:alnum:]' '-' | sed 's/^-*//; s/-*$//')
+            [ -n "$SLUG" ] || SLUG=module
+            STEM="${SLUG}-${RUN_NUMBER}"
+          fi
+          for key in source_repo branch name version tag run_id; do
+            echo "$key=$(jq -r --arg k "$key" '.[$k] // ""' "$META")" >> "$GITHUB_OUTPUT"
+          done
+          echo "stem=$STEM" >> "$GITHUB_OUTPUT"
+          if [ -n "$FILENAME" ]; then
+            echo "zip=build-output/$FILENAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "zip=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "log=$STEM-log.txt" >> "$GITHUB_OUTPUT"
+          echo "log_archive=$STEM-log-archive.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch run logs
+        id: logs
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          OWNER: ${{ steps.wait.outputs.owner }}
+          REPO_NAME: ${{ steps.wait.outputs.repo }}
+          LOG_FILE: ${{ steps.meta.outputs.log }}
+          ARCHIVE_FILE: ${{ steps.meta.outputs.log_archive }}
+        run: |
+          set +e
+          TEXT_OK=false
+          ARCHIVE_OK=false
+          for attempt in 1 2 3 4 5 6; do
+            gh run view "$RUN_ID" --repo "$OWNER/$REPO_NAME" --log > "$LOG_FILE" 2> /tmp/gh-view.err
+            status=$?
+            if [ $status -eq 0 ] && [ -s "$LOG_FILE" ] && grep -q "Complete job" "$LOG_FILE"; then
+              TEXT_OK=true
+              break
+            fi
+            echo "::warning::build log text attempt $attempt failed for run $RUN_ID"
+            if [ -s /tmp/gh-view.err ]; then
+              cat /tmp/gh-view.err >&2
+            fi
+            if [ $attempt -lt 6 ]; then
+              sleep 10
+            fi
+          done
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -L -sS -o "$ARCHIVE_FILE" -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$OWNER/$REPO_NAME/actions/runs/$RUN_ID/logs")
+            if [ "$code" = "200" ] && [ -s "$ARCHIVE_FILE" ]; then
+              ARCHIVE_OK=true
+              break
+            fi
+            echo "::warning::build log archive attempt $attempt failed with HTTP $code"
+            if [ $attempt -lt 6 ]; then
+              sleep 10
+            fi
+          done
+          echo "text_ok=$TEXT_OK" >> "$GITHUB_OUTPUT"
+          echo "archive_ok=$ARCHIVE_OK" >> "$GITHUB_OUTPUT"
+
+      - name: Read run status
+        id: status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GHTOKEN }}
+          script: |
+            const inputs = context.payload.inputs || {};
+            const owner = '${{ steps.wait.outputs.owner }}';
+            const repo = '${{ steps.wait.outputs.repo }}';
+            const runId = Number(inputs.run_id);
+            const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+            const status = data.conclusion === 'success' ? 'success' : 'failure';
+            const seconds = Math.max(0, Math.round(
+              (new Date(data.updated_at).getTime() - new Date(data.created_at).getTime()) / 1000
+            ));
+            const runtime = `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+            core.setOutput('status', status);
+            core.setOutput('runtime', runtime);
+            core.setOutput('conclusion', data.conclusion || '');
+
+      - name: Publish deferred release
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TEST_BUILDS }}
+          SOURCE_REPO: ${{ steps.meta.outputs.source_repo }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
+          NAME: ${{ steps.meta.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          STATUS: ${{ steps.status.outputs.status }}
+          RUNTIME: ${{ steps.status.outputs.runtime }}
+          ZIP: ${{ steps.meta.outputs.zip }}
+          LOG: ${{ steps.meta.outputs.log }}
+          LOG_ARCHIVE: ${{ steps.meta.outputs.log_archive }}
+        run: |
+          python3 release.py publish --deferred \
+            --metadata-file build-output/metadata.json \
+            --source-repo "$SOURCE_REPO" \
+            --branch "$BRANCH" \
+            --name "$NAME" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --status "$STATUS" \
+            --runtime "$RUNTIME" \
+            --zip "$ZIP" \
+            --log "$LOG" \
+            --log-archive "$LOG_ARCHIVE"
+
+      - name: Write release summary
+        id: summary
+        if: ${{ always() }}
+        env:
+          RELEASE_OK: ${{ steps.publish.outputs.release_ok }}
+          TELEGRAM_OK: ${{ steps.publish.outputs.telegram_ok }}
+          TELEGRAM_DESCRIPTION: ${{ steps.publish.outputs.telegram_description }}
+          TEXT_OK: ${{ steps.logs.outputs.text_ok }}
+          ARCHIVE_OK: ${{ steps.logs.outputs.archive_ok }}
+          TARGET_REPO: ${{ inputs.repo }}
+          RUN_ID: ${{ inputs.run_id }}
+          ZIP: ${{ steps.meta.outputs.zip }}
+          LOG: ${{ steps.meta.outputs.log }}
+          LOG_ARCHIVE: ${{ steps.meta.outputs.log_archive }}
+        run: |
+          ok=false
+          if [ "$RELEASE_OK" = "true" ] && [ "$TELEGRAM_OK" = "true" ]; then
+            ok=true
+          fi
+          {
+            echo "## Deferred release"
+            echo "- Target run: $RUN_ID in $TARGET_REPO"
+            echo "- GitHub release: $([ "$RELEASE_OK" = "true" ] && echo ok || echo failed)"
+            echo "- Telegram: $([ "$TELEGRAM_OK" = "true" ] && echo ok || echo failed)"
+            if [ -n "$TELEGRAM_DESCRIPTION" ]; then
+              echo "  - Telegram description: $TELEGRAM_DESCRIPTION"
+            fi
+            echo "- Files sent:"
+            if [ -n "$ZIP" ] && [ -f "$ZIP" ]; then
+              echo "  - module zip: $ZIP"
+            else
+              echo "  - module zip: not sent"
+            fi
+            if [ -n "$LOG" ] && [ -f "$LOG" ]; then
+              echo "  - build log: $LOG"
+            else
+              echo "  - build log: not sent"
+            fi
+            if [ -n "$LOG_ARCHIVE" ] && [ -f "$LOG_ARCHIVE" ]; then
+              echo "  - log archive: $LOG_ARCHIVE"
+            else
+              echo "  - log archive: not sent"
+            fi
+            gap=false
+            if [ "$TEXT_OK" != "true" ]; then
+              echo "- Gap: build log text was not fetched completely"
+              gap=true
+            fi
+            if [ "$ARCHIVE_OK" != "true" ]; then
+              echo "- Gap: build log archive was not fetched completely"
+              gap=true
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          if [ "$gap" = "true" ]; then
+            echo "::error::build log fetch incomplete"
+            exit 1
+          fi
+
   cleanup:
+    needs: release
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Purge old workflow runs
@@ -59,64 +307,67 @@ jobs:
             const branch = (inputs.branch || '').trim();
             const keep = Math.max(0, parseInt(inputs.keep, 10) || 0);
             const self = context.runId;
+            const releaseRequested = String(inputs.release || 'false').toLowerCase() === 'true';
+            const releaseSucceeded = '${{ needs.release.result }}' === 'success';
+            const targetRunId = Number(inputs.run_id);
 
+            let target, owner, repo, isSelfRepo, runId, runs;
             try {
               const me = await github.rest.users.getAuthenticated();
               core.info(`Authenticated as: ${me.data.login} (${me.data.type})`);
+
+              target = (inputs.repo || '').trim()
+                .replace(/^https?:\/\/github\.com\//i, '')
+                .replace(/\.git$/i, '')
+                .replace(/^\/+|\/+$/g, '');
+              if (target && target.includes('/')) {
+                [owner, repo] = target.split('/').slice(0, 2);
+              } else {
+                ({ owner, repo } = context.repo);
+              }
+              target = `${owner}/${repo}`;
+              isSelfRepo = owner === context.repo.owner && repo === context.repo.repo;
+
+              const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+              runId = Number(inputs.run_id);
+              if (!runId) {
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner, repo, per_page: 10
+                });
+                const latest = data.workflow_runs.find(r => !(isSelfRepo && r.id === self));
+                runId = latest?.id || 0;
+                if (runId && latest.status !== 'completed') {
+                  core.info(`No run_id given - waiting for latest run "${latest.name}" #${latest.run_number} (${runId}) to finish.`);
+                }
+              }
+
+              if (runId) {
+                let concluded = null;
+                for (let i = 0; i < 60; i++) {
+                  const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+                  if (data.status === 'completed') { concluded = data; break; }
+                  if (i === 0) core.info(`Run ${runId} is still running - waiting (checks every 5s, max 5 min)...`);
+                  await sleep(5000);
+                }
+                if (concluded) {
+                  core.info(`Run ${runId} concluded: ${concluded.conclusion} - proceeding with purge.`);
+                } else {
+                  core.warning(`Run ${runId} still running after 5 min - purging anyway (running run is skipped automatically).`);
+                }
+              }
+
+              const listParams = { owner, repo, per_page: 100 };
+              if (branch) listParams.branch = branch;
+
+              runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                listParams
+              );
             } catch (e) {
-              core.setFailed(`GHTOKEN secret is missing or invalid: ${e.message}`);
+              core.setFailed(`Purge setup failed, deleting nothing: ${e.message}`);
               return;
             }
-
-            let target = (inputs.repo || '').trim()
-              .replace(/^https?:\/\/github\.com\//i, '')
-              .replace(/\.git$/i, '')
-              .replace(/^\/+|\/+$/g, '');
-            let owner, repo;
-            if (target && target.includes('/')) {
-              [owner, repo] = target.split('/').slice(0, 2);
-            } else {
-              ({ owner, repo } = context.repo);
-            }
-            target = `${owner}/${repo}`;
-            const isSelfRepo = owner === context.repo.owner && repo === context.repo.repo;
-
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-            let runId = Number(inputs.run_id);
-            if (!runId) {
-              const { data } = await github.rest.actions.listWorkflowRunsForRepo({
-                owner, repo, per_page: 10
-              });
-              const latest = data.workflow_runs.find(r => !(isSelfRepo && r.id === self));
-              runId = latest?.id || 0;
-              if (runId && latest.status !== 'completed') {
-                core.info(`No run_id given — waiting for latest run "${latest.name}" #${latest.run_number} (${runId}) to finish.`);
-              }
-            }
-
-            if (runId) {
-              let concluded = null;
-              for (let i = 0; i < 60; i++) {
-                const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
-                if (data.status === 'completed') { concluded = data; break; }
-                if (i === 0) core.info(`Run ${runId} is still running — waiting (checks every 5s, max 5 min)...`);
-                await sleep(5000);
-              }
-              if (concluded) {
-                core.info(`Run ${runId} concluded: ${concluded.conclusion} — proceeding with purge.`);
-              } else {
-                core.warning(`Run ${runId} still running after 5 min — purging anyway (running run is skipped automatically).`);
-              }
-            }
-
-            const listParams = { owner, repo, per_page: 100 };
-            if (branch) listParams.branch = branch;
-
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
-              listParams
-            );
 
             const byWorkflow = new Map();
             for (const run of runs) {
@@ -126,6 +377,9 @@ jobs:
               byWorkflow.get(run.workflow_id).push(run);
             }
 
+            const isCleanupRun = run =>
+              (run.path || '').startsWith('.github/workflows/cleanup.yml') || run.name === 'Cleanup';
+            const keptFailedCleanup = [];
             let deleted = 0;
             const lines = [];
             for (const [workflowId, group] of byWorkflow) {
@@ -133,27 +387,42 @@ jobs:
                 b.created_at.localeCompare(a.created_at) || b.run_number - a.run_number
               );
               const name = group[0].name || `workflow ${workflowId}`;
-              lines.push(`### ${name} — keeping ${Math.min(keep, group.length)} of ${group.length}`);
+              lines.push(`### ${name} - keeping ${Math.min(keep, group.length)} of ${group.length}`);
               for (let i = 0; i < group.length; i++) {
                 const run = group[i];
+                if (isCleanupRun(run) && run.conclusion !== 'success') {
+                  keptFailedCleanup.push(`#${run.run_number} (${run.conclusion || 'no conclusion'}, ${run.created_at})`);
+                  lines.push(`- kept failed Cleanup #${run.run_number} (${run.conclusion || 'no conclusion'})`);
+                  continue;
+                }
+                if (releaseRequested && !releaseSucceeded && targetRunId && run.id === targetRunId) {
+                  core.warning(`Release failed for run ${targetRunId}. Re-run cleanup with release=true and run_id=${targetRunId}.`);
+                  lines.push(`- kept target run #${run.run_number} because release failed`);
+                  continue;
+                }
                 if (i < keep) {
-                  lines.push(`- ✅ kept #${run.run_number} (${run.created_at})`);
+                  lines.push(`- kept #${run.run_number} (${run.created_at})`);
                   continue;
                 }
                 try {
                   await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
                   deleted++;
-                  lines.push(`- 🗑️ deleted #${run.run_number} (${run.created_at})`);
+                  lines.push(`- deleted #${run.run_number} (${run.created_at})`);
                 } catch (e) {
-                  lines.push(`- ⚠️ failed to delete #${run.run_number}: ${e.message}`);
+                  lines.push(`- failed to delete #${run.run_number}: ${e.message}`);
                 }
               }
             }
 
             if (byWorkflow.size === 0) lines.push('No completed runs found to clean.');
+            if (keptFailedCleanup.length) {
+              lines.push('');
+              lines.push('### Failed Cleanup runs kept');
+              for (const entry of keptFailedCleanup) lines.push(`- ${entry}`);
+            }
 
             await core.summary
-              .addHeading(`Workflow run cleanup — ${target}`)
+              .addHeading(`Workflow run cleanup - ${target}`)
               .addRaw(`Branch filter: ${branch || 'all'} • Keep per workflow: ${keep} • Deleted: ${deleted}`)
               .addSeparator()
               .addRaw(lines.join('\n'))
@@ -170,7 +439,7 @@ jobs:
             const doTags = String(inputs.delete_tags ?? 'true').toLowerCase() !== 'false';
 
             if (raw === '') {
-              core.info('releases_to_delete is empty — nothing to delete.');
+              core.info('releases_to_delete is empty - nothing to delete.');
               return;
             }
             const want = parseInt(raw, 10);
@@ -210,7 +479,7 @@ jobs:
               toDelete = releases.slice();
               orderLabel = 'all';
             } else if (want <= 0) {
-              core.info(`releases_to_delete=${want} — nothing to delete.`);
+              core.info(`releases_to_delete=${want} - nothing to delete.`);
               return;
             } else if (raw.startsWith('+')) {
               toDelete = releases.slice(0, want);
@@ -246,7 +515,7 @@ jobs:
             }
 
             await core.summary
-              .addHeading(`Release cleanup — ${owner}/${repo}`)
+              .addHeading(`Release cleanup - ${owner}/${repo}`)
               .addRaw(`Requested: ${raw} • Delete tags: ${doTags} • Deleted: ${deleted} (${orderLabel})`)
               .addSeparator()
               .addRaw(lines.join('\n') || 'Nothing matched.')

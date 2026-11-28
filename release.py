@@ -59,6 +59,10 @@ def tag_safe(s):
     return "".join(out).strip("-.")
 
 
+def html_escape(value):
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def gh_output(key, value):
     path = os.environ.get("GITHUB_OUTPUT")
     if path:
@@ -161,21 +165,30 @@ def build_label(tag):
     return "☢️ Dev Build"
 
 
-def compose(template, *, branch, source_repo, version, runtime, run_number, as_html, tag="dev"):
+def compose(template, *, branch, source_repo, version, runtime, run_number, as_html, tag="dev", meta=None):
     repo_name = source_repo.split("/", 1)[1]
     ci_name = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
-    commit_msg = sh("git log -1 --pretty=%B")
-    commit_hash = sh("git rev-parse HEAD")
-    commit_short = sh("git rev-parse --short HEAD")
-    commit_no = sh("git rev-list --count HEAD") or "n/a"
-    commit_url = f"{os.environ['GITHUB_SERVER_URL']}/{source_repo}/commit/{commit_hash}"
-
-    if as_html:
-        if len(commit_msg) > 700:
-            rendered = commit_url
+    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    if meta is None:
+        commit_msg = sh("git log -1 --pretty=%B")
+        commit_hash = sh("git rev-parse HEAD")
+        commit_short = sh("git rev-parse --short HEAD")
+        commit_no = sh("git rev-list --count HEAD") or "n/a"
+        commit_url = f"{server_url}/{source_repo}/commit/{commit_hash}"
+        if as_html:
+            if len(commit_msg) > 700:
+                rendered = commit_url
+            else:
+                rendered = commit_msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         else:
-            rendered = commit_msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            rendered = commit_url if len(commit_msg) > 700 else commit_msg
     else:
+        commit_msg = str(meta.get("commit_msg") or "")
+        commit_hash = str(meta.get("commit_hash") or "")
+        commit_short = str(meta.get("commit_short") or "")
+        commit_no = str(meta.get("commit_no") or "") or "n/a"
+        run_number = str(meta.get("run_number") or run_number)
+        commit_url = f"{server_url}/{source_repo}/commit/{commit_hash}"
         rendered = commit_url if len(commit_msg) > 700 else commit_msg
 
     values = {
@@ -192,6 +205,9 @@ def compose(template, *, branch, source_repo, version, runtime, run_number, as_h
         "runtime": runtime,
         "build_label": build_label(tag),
     }
+    if as_html and meta is not None:
+        values = {key: html_escape(value) if isinstance(value, str) else value
+                  for key, value in values.items()}
     return template.format(**values)
 
 
@@ -222,7 +238,370 @@ def send_telegram(bot_token, chat_id, zip_path, keyboard):
     ])
 
 
+TELEGRAM_FILE_LIMIT = 49 * 1024 * 1024
+
+
+def redact_command(cmd):
+    return " ".join(
+        "<redacted>" if "api.telegram.org/bot" in str(part) else str(part)
+        for part in cmd
+    )
+
+
+def run_report(cmd, label):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as exc:
+        print(f"{label} raised: {exc}", file=sys.stderr)
+        return subprocess.CompletedProcess(cmd, 1, "", str(exc))
+    if result.returncode != 0:
+        print(f"{label} failed: {redact_command(cmd)}", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr.strip(), file=sys.stderr)
+    return result
+
+
+def retry_command(cmd, label, attempts=3, delay=5):
+    result = None
+    for attempt in range(1, attempts + 1):
+        result = run_report(cmd, f"{label} attempt {attempt}/{attempts}")
+        if result.returncode == 0:
+            return result
+        if attempt < attempts:
+            time.sleep(delay)
+    return result
+
+
+def inspect_release(tag, source_repo):
+    cmd = ["gh", "release", "view", tag, "--repo", source_repo, "--json", "name,tagName"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except Exception as exc:
+        print(f"release view raised: {exc}", file=sys.stderr)
+        return {}
+    if result.returncode == 0:
+        try:
+            return json.loads(result.stdout or "{}")
+        except Exception as exc:
+            print(f"release view parse failed: {exc}", file=sys.stderr)
+            return {}
+    detail = (result.stderr or result.stdout or "").strip()
+    lower = detail.lower()
+    if "not found" in lower or "could not resolve" in lower or "no release" in lower:
+        return None
+    print(f"release view failed: {redact_command(cmd)}", file=sys.stderr)
+    if detail:
+        print(detail, file=sys.stderr)
+    return {}
+
+
+def telegram_request(cmd, label):
+    result = run_report(cmd, label)
+    response = (result.stdout or "").strip()
+    if response:
+        print(response)
+    description = ""
+    try:
+        data = json.loads(response or "{}")
+        ok = data.get("ok") is True
+        description = str(data.get("description") or "")
+    except Exception as exc:
+        ok = False
+        description = f"invalid Telegram response: {exc}"
+    if not ok:
+        print(f"{label} failed: {redact_command(cmd)}", file=sys.stderr)
+        print(f"{label} description: {description or 'no description'}", file=sys.stderr)
+    return ok, description
+
+
+def telegram_send_message(bot_token, chat_id, text):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    cmd = [
+        "curl", "-sS", "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps(payload),
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+    ]
+    return telegram_request(cmd, "sendMessage")
+
+
+def telegram_send_document(bot_token, chat_id, path, caption):
+    cmd = [
+        "curl", "-sS", "-X", "POST",
+        "--form-string", f"chat_id={chat_id}",
+        "-F", f"document=@{path}",
+        "--form-string", f"caption={caption}",
+        "--form-string", "parse_mode=HTML",
+        f"https://api.telegram.org/bot{bot_token}/sendDocument",
+    ]
+    return telegram_request(cmd, "sendDocument")
+
+
+def telegram_send_album(bot_token, chat_id, paths, caption):
+    media = []
+    cmd = [
+        "curl", "-sS", "-X", "POST",
+        "--form-string", f"chat_id={chat_id}",
+    ]
+    for index, path in enumerate(paths):
+        item = {"type": "document", "media": f"attach://file{index}"}
+        if index == 0:
+            item["caption"] = caption
+            item["parse_mode"] = "HTML"
+        media.append(item)
+        cmd += ["-F", f"file{index}=@{path}"]
+    cmd += [
+        "--form-string", f"media={json.dumps(media)}",
+        f"https://api.telegram.org/bot{bot_token}/sendMediaGroup",
+    ]
+    return telegram_request(cmd, "sendMediaGroup")
+
+
+def button_links(args, repo_url, tag):
+    try:
+        keyboard = resolve_buttons(args, repo_url, tag)
+        rows = keyboard.get("inline_keyboard") or []
+    except Exception as exc:
+        print(f"button parsing failed: {exc}", file=sys.stderr)
+        rows = [[{"text": "Release", "url": f"{repo_url}/releases/tag/{tag}"}]]
+    links = []
+    for row in rows:
+        for button in row:
+            url = str(button.get("url") or "")
+            if not url:
+                continue
+            text = html_escape(button.get("text") or "Link")
+            links.append(f'<a href="{html_escape(url)}">{text}</a>')
+    return " ".join(links)
+
+
+def cmd_publish_deferred(args):
+    if not args.metadata_file or not os.path.isfile(args.metadata_file):
+        print(f"deferred publish: metadata file not found: {args.metadata_file}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(args.metadata_file) as handle:
+            meta = json.load(handle)
+    except Exception as exc:
+        print(f"deferred publish: cannot read metadata: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    sha = str(meta.get("commit_hash") or "").strip()
+    if not sha:
+        print("deferred publish: commit_hash is empty in metadata", file=sys.stderr)
+        sys.exit(1)
+
+    run_number = str(meta.get("run_number") or "")
+    display_name = args.name or args.branch or str(meta.get("name") or "")
+    if not display_name:
+        display_name = "module"
+
+    release_files = []
+    for path in (args.zip, args.log, args.log_archive):
+        if path and os.path.isfile(path):
+            release_files.append(path)
+    for path in release_files:
+        if " " in os.path.basename(path):
+            print(f"deferred publish: asset name contains a space: {path}", file=sys.stderr)
+            sys.exit(1)
+
+    version_tag = tag_safe(args.version.strip()) if args.version else ""
+    tag = version_tag or f"{slugify(display_name)}-{run_number}"
+    existing = inspect_release(tag, args.source_repo)
+    if args.status != "success" and existing is not None:
+        existing_title = str(existing.get("name") or "")
+        if not existing_title.startswith("[FAILED]"):
+            tag = f"{tag}-failed-{run_number}"
+
+    html_tpl = read_template(args, "msg") or DEFAULT_HTML
+    md_tpl = read_template(args, "notes") or DEFAULT_MD
+    notes = compose(md_tpl, branch=args.branch, source_repo=args.source_repo,
+                    version=args.version, runtime=args.runtime,
+                    run_number=run_number, as_html=False, tag=args.tag, meta=meta)
+    caption = compose(html_tpl, branch=args.branch, source_repo=args.source_repo,
+                      version=args.version, runtime=args.runtime,
+                      run_number=run_number, as_html=True, tag=args.tag, meta=meta)
+    with open("/tmp/notes_deferred.md", "w") as handle:
+        handle.write(notes)
+
+    if args.version:
+        title = f"{display_name} - Version {args.version} Changelog"
+    else:
+        title = f"{display_name} Changelog"
+    if args.status != "success":
+        title = f"[FAILED] {title}"
+
+    delete_cmd = [
+        "gh", "release", "delete", tag, "--repo", args.source_repo,
+        "--cleanup-tag", "-y",
+    ]
+    delete = subprocess.run(delete_cmd, capture_output=True, text=True)
+    if delete.returncode != 0:
+        detail = (delete.stderr or delete.stdout or "").strip()
+        if "not found" not in detail.lower() and "could not resolve" not in detail.lower():
+            print(f"release delete failed: {redact_command(delete_cmd)}", file=sys.stderr)
+            if detail:
+                print(detail, file=sys.stderr)
+
+    create_cmd = [
+        "gh", "release", "create", tag,
+        "--repo", args.source_repo,
+        "--target", sha,
+        "--title", title,
+        "--notes-file", "/tmp/notes_deferred.md",
+    ]
+    release_ok = False
+    create = None
+    for attempt in range(1, 4):
+        create = run_report(create_cmd, f"release create attempt {attempt}/3")
+        if create.returncode == 0:
+            release_ok = True
+            break
+        if attempt < 3:
+            time.sleep(5)
+    if not release_ok:
+        print("deferred publish: release creation failed after 3 attempts", file=sys.stderr)
+
+    expected_assets = []
+    if release_ok:
+        for path in release_files:
+            name = os.path.basename(path)
+            expected_assets.append(name)
+            upload_cmd = [
+                "gh", "release", "upload", tag, path,
+                "--repo", args.source_repo, "--clobber",
+            ]
+            uploaded = False
+            for attempt in range(1, 4):
+                upload = run_report(upload_cmd, f"release upload attempt {attempt}/3 for {name}")
+                if upload.returncode == 0:
+                    uploaded = True
+                    break
+                if attempt < 3:
+                    time.sleep(5)
+            if not uploaded:
+                print(f"deferred publish: upload failed for {name}", file=sys.stderr)
+        view = run_report(
+            ["gh", "release", "view", tag, "--repo", args.source_repo, "--json", "assets"],
+            "release view",
+        )
+        if view.returncode != 0:
+            release_ok = False
+        else:
+            try:
+                assets = json.loads(view.stdout or "{}").get("assets") or []
+                present = {str(asset.get("name") or "") for asset in assets}
+            except Exception as exc:
+                print(f"release view parse failed: {exc}", file=sys.stderr)
+                present = set()
+            missing = [name for name in expected_assets if name not in present]
+            if missing:
+                print(f"deferred publish: missing release assets: {', '.join(missing)}", file=sys.stderr)
+                release_ok = False
+
+    bot_token = os.environ.get("BOT_TOKEN")
+    chat_id = os.environ.get("CHAT_ID")
+    telegram_ok = False
+    telegram_description = ""
+    if not bot_token or not chat_id:
+        telegram_description = "BOT_TOKEN or CHAT_ID is missing"
+        print(f"deferred publish: {telegram_description}", file=sys.stderr)
+    else:
+        repo_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{args.source_repo}"
+        links = button_links(args, repo_url, tag)
+        telegram_files = []
+        if args.status == "success" and args.zip and os.path.isfile(args.zip):
+            telegram_files.append(args.zip)
+        for path in (args.log, args.log_archive):
+            if path and os.path.isfile(path):
+                telegram_files.append(path)
+
+        oversized = []
+        accepted = []
+        for path in telegram_files:
+            if os.path.getsize(path) > TELEGRAM_FILE_LIMIT:
+                oversized.append(os.path.basename(path))
+            else:
+                accepted.append(path)
+
+        description = caption.rstrip()
+        if oversized:
+            description += "\nOversized file omitted: " + ", ".join(html_escape(name) for name in oversized)
+        full_caption = description + ("\n" + links if links else "")
+        short_caption = links if links else "Release details are in the job summary"
+
+        if len(full_caption) > 1024:
+            sent, detail = telegram_send_message(bot_token, chat_id, description)
+            if sent:
+                telegram_ok = True
+                telegram_description = detail
+            else:
+                telegram_description = detail
+
+        if len(accepted) > 1:
+            sent, detail = telegram_send_album(bot_token, chat_id, accepted, short_caption if len(full_caption) > 1024 else full_caption)
+            if sent:
+                telegram_ok = True
+                telegram_description = detail
+            else:
+                telegram_description = detail
+                zip_path = args.zip if args.status == "success" and args.zip in accepted else ""
+                if zip_path:
+                    sent, detail = telegram_send_document(bot_token, chat_id, zip_path, short_caption if len(full_caption) > 1024 else full_caption)
+                    if sent:
+                        telegram_ok = True
+                        telegram_description = detail
+                    else:
+                        telegram_description = detail
+                if not telegram_ok:
+                    sent, detail = telegram_send_message(bot_token, chat_id, short_caption)
+                    if sent:
+                        telegram_ok = True
+                        telegram_description = detail
+                    else:
+                        telegram_description = detail
+        elif len(accepted) == 1:
+            sent, detail = telegram_send_document(
+                bot_token, chat_id, accepted[0],
+                short_caption if len(full_caption) > 1024 else full_caption,
+            )
+            if sent:
+                telegram_ok = True
+                telegram_description = detail
+            else:
+                telegram_description = detail
+                sent, detail = telegram_send_message(bot_token, chat_id, short_caption)
+                if sent:
+                    telegram_ok = True
+                    telegram_description = detail
+                else:
+                    telegram_description = detail
+        else:
+            sent, detail = telegram_send_message(
+                bot_token, chat_id,
+                description if len(description) <= 1024 else short_caption,
+            )
+            if sent:
+                telegram_ok = True
+                telegram_description = detail
+            else:
+                telegram_description = detail
+
+    gh_output("release_ok", "true" if release_ok else "false")
+    gh_output("telegram_ok", "true" if telegram_ok else "false")
+    gh_output("telegram_description", telegram_description.replace("\r", " ").replace("\n", " "))
+    sys.exit(0 if release_ok and telegram_ok else 1)
+
+
 def cmd_publish(args):
+    if args.deferred:
+        cmd_publish_deferred(args)
+        return
     run_number = os.environ["GITHUB_RUN_NUMBER"]
     display_name = args.name or args.branch
 
@@ -339,6 +718,11 @@ def main():
     p_pub.add_argument("--notes-file", default="")
     p_pub.add_argument("--buttons", default="")
     p_pub.add_argument("--buttons-file", default="")
+    p_pub.add_argument("--deferred", action="store_true")
+    p_pub.add_argument("--metadata-file", default="")
+    p_pub.add_argument("--log", default="")
+    p_pub.add_argument("--log-archive", default="")
+    p_pub.add_argument("--runtime", default="")
     p_pub.set_defaults(func=cmd_publish)
 
     args = parser.parse_args()

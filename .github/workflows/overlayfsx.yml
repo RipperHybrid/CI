@@ -105,21 +105,62 @@ jobs:
           cd target/module
           zip -r "../../../${{ steps.metadata.outputs.filename }}" .
 
-      - name: Publish
+      - name: Write metadata
         if: ${{ always() && steps.src.outcome == 'success' }}
         working-directory: src
         env:
-          GH_TOKEN: ${{ secrets.GHTOKEN }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TEST_BUILDS }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          FILENAME: ${{ steps.metadata.outputs.filename }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ID: ${{ github.run_id }}
+          NAME: Overlayfsx
+          TAG: ${{ env.BUILD_TAG }}
+          BRANCH: ${{ env.TARGET_BRANCH }}
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
         run: |
-          python3 ../release.py publish \
-            --source-repo "${{ env.SOURCE_REPO }}" \
-            --branch "${{ env.TARGET_BRANCH }}" \
-            --name "Overlayfsx" \
-            --version "${{ steps.metadata.outputs.version }}" \
-            --status "${{ job.status }}" \
-            --tag "$BUILD_TAG" \
-            --zip "../${{ steps.metadata.outputs.filename }}" \
-            --cleanup-keep "$CLEANUP_KEEP" \
-            --start-ts-file /tmp/build_start_ts
+          jq -n \
+            --arg commit_msg "$(git log -1 --pretty=%B)" \
+            --arg commit_hash "$(git rev-parse HEAD)" \
+            --arg commit_short "$(git rev-parse --short HEAD)" \
+            --arg commit_no "$(git rev-list --count HEAD)" \
+            --arg run_number "$RUN_NUMBER" \
+            --arg run_id "$RUN_ID" \
+            --arg version "$VERSION" \
+            --arg name "$NAME" \
+            --arg tag "$TAG" \
+            --arg branch "$BRANCH" \
+            --arg source_repo "$SOURCE_REPO" \
+            --arg filename "$FILENAME" \
+            '{commit_msg: $commit_msg, commit_hash: $commit_hash, commit_short: $commit_short, commit_no: $commit_no, run_number: $run_number, run_id: $run_id, version: $version, name: $name, tag: $tag, branch: $branch, source_repo: $source_repo, filename: $filename}' \
+            > "$GITHUB_WORKSPACE/metadata.json"
+
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            ${{ steps.metadata.outputs.filename }}
+            metadata.json
+          if-no-files-found: ignore
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
+      - name: Dispatch Cleanup
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          REF: ${{ github.ref_name }}
+          KEEP: ${{ env.CLEANUP_KEEP }}
+          RELEASE: ${{ steps.src.outcome == 'success' && 'true' || 'false' }}
+        run: |
+          gh workflow run cleanup.yml --repo "$REPO" \
+            -f "repo=$REPO" \
+            -f "run_id=$RUN_ID" \
+            -f "branch=$REF" \
+            -f "keep=$KEEP" \
+            -f "release=$RELEASE" \
+          || echo "::warning::cleanup dispatch failed (build unaffected)"

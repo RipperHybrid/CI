@@ -217,7 +217,7 @@ jobs:
           done
 
           if [ ${#COPIED[@]} -eq 0 ]; then
-            echo "::error::none of the pack entries exist — refusing to publish empty zip"
+            echo "::error::none of the pack entries exist - refusing to publish empty zip"
             printf '  - %s\n' "${PACK_LIST[@]}"
             exit 1
           fi
@@ -231,32 +231,67 @@ jobs:
           ( cd "$STAGE" && zip -r -q "$OLDPWD/$OUT_ZIP" . )
           echo "ZIP: $OUT_ZIP ($(du -h "$OUT_ZIP" | cut -f1))"
 
-      - name: Publish
+      - name: Write metadata
         if: ${{ always() && steps.src.outcome == 'success' }}
         working-directory: src
         env:
-          GH_TOKEN: ${{ secrets.GHTOKEN }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TEST_BUILDS }}
-          TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
-          TARGET_COMMIT: ${{ inputs.target_commit }}
-          BUILD_TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          FILENAME: ${{ steps.metadata.outputs.filename }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ID: ${{ github.run_id }}
+          NAME_PREFIX: ${{ env.PREFIX }}
+          META_NAME: ${{ steps.metadata.outputs.name }}
+          TAG: ${{ inputs.tag }}
+          BRANCH: ${{ env.TARGET_BRANCH }}
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
         run: |
-          ZIP_ARG=""
-          if [ -f "../${{ steps.metadata.outputs.filename }}" ]; then
-            ZIP_ARG="--zip ../${{ steps.metadata.outputs.filename }}"
-          fi
-          NAME="${PREFIX}"
+          NAME="$NAME_PREFIX"
           if [ -z "$NAME" ]; then
-            NAME="${{ steps.metadata.outputs.name }}"
+            NAME="$META_NAME"
           fi
-          python3 ../release.py publish \
-            --source-repo "${SOURCE_REPO}" \
-            --branch "${TARGET_BRANCH}" \
-            --name "${NAME}" \
-            --version "${{ steps.metadata.outputs.version }}" \
-            --status "${{ job.status }}" \
-            --tag "${BUILD_TAG}" \
-            ${ZIP_ARG} \
-            --cleanup-keep "${{ inputs.cleanup_keep }}" \
-            --start-ts-file /tmp/build_start_ts
+          jq -n \
+            --arg commit_msg "$(git log -1 --pretty=%B)" \
+            --arg commit_hash "$(git rev-parse HEAD)" \
+            --arg commit_short "$(git rev-parse --short HEAD)" \
+            --arg commit_no "$(git rev-list --count HEAD)" \
+            --arg run_number "$RUN_NUMBER" \
+            --arg run_id "$RUN_ID" \
+            --arg version "$VERSION" \
+            --arg name "$NAME" \
+            --arg tag "$TAG" \
+            --arg branch "$BRANCH" \
+            --arg source_repo "$SOURCE_REPO" \
+            --arg filename "$FILENAME" \
+            '{commit_msg: $commit_msg, commit_hash: $commit_hash, commit_short: $commit_short, commit_no: $commit_no, run_number: $run_number, run_id: $run_id, version: $version, name: $name, tag: $tag, branch: $branch, source_repo: $source_repo, filename: $filename}' \
+            > "$GITHUB_WORKSPACE/metadata.json"
+
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            ${{ steps.metadata.outputs.filename }}
+            metadata.json
+          if-no-files-found: ignore
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
+      - name: Dispatch Cleanup
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GHTOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          REF: ${{ github.ref_name }}
+          KEEP: ${{ inputs.cleanup_keep }}
+          RELEASE: ${{ steps.src.outcome == 'success' && 'true' || 'false' }}
+        run: |
+          gh workflow run cleanup.yml --repo "$REPO" \
+            -f "repo=$REPO" \
+            -f "run_id=$RUN_ID" \
+            -f "branch=$REF" \
+            -f "keep=$KEEP" \
+            -f "release=$RELEASE" \
+          || echo "::warning::cleanup dispatch failed (build unaffected)"
