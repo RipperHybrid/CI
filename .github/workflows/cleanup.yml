@@ -135,7 +135,6 @@ jobs:
           else
             echo "zip=" >> "$GITHUB_OUTPUT"
           fi
-          echo "log=$STEM-log.txt" >> "$GITHUB_OUTPUT"
           echo "log_archive=$STEM-log-archive.zip" >> "$GITHUB_OUTPUT"
 
       - name: Fetch run logs
@@ -145,42 +144,30 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
           OWNER: ${{ steps.wait.outputs.owner }}
           REPO_NAME: ${{ steps.wait.outputs.repo }}
-          LOG_FILE: ${{ steps.meta.outputs.log }}
           ARCHIVE_FILE: ${{ steps.meta.outputs.log_archive }}
         run: |
           set +e
-          TEXT_OK=false
           ARCHIVE_OK=false
           for attempt in 1 2 3 4 5 6; do
-            gh run view "$RUN_ID" --repo "$OWNER/$REPO_NAME" --log > "$LOG_FILE" 2> /tmp/gh-view.err
-            status=$?
-            if [ $status -eq 0 ] && [ -s "$LOG_FILE" ] && grep -q "Complete job" "$LOG_FILE"; then
-              TEXT_OK=true
-              break
-            fi
-            echo "::warning::build log text attempt $attempt failed for run $RUN_ID"
-            if [ -s /tmp/gh-view.err ]; then
-              cat /tmp/gh-view.err >&2
-            fi
-            if [ $attempt -lt 6 ]; then
-              sleep 10
-            fi
-          done
-          for attempt in 1 2 3 4 5 6; do
+            rm -f "$ARCHIVE_FILE" /tmp/unzip-test.log
             code=$(curl -L -sS -o "$ARCHIVE_FILE" -w '%{http_code}' \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$OWNER/$REPO_NAME/actions/runs/$RUN_ID/logs")
-            if [ "$code" = "200" ] && [ -s "$ARCHIVE_FILE" ]; then
+            if [ "$code" = "200" ] && [ -s "$ARCHIVE_FILE" ] \
+              && unzip -t "$ARCHIVE_FILE" > /tmp/unzip-test.log 2>&1 \
+              && unzip -l "$ARCHIVE_FILE" 2> /dev/null | grep -Eq 'Complete job\.txt$'; then
               ARCHIVE_OK=true
               break
             fi
-            echo "::warning::build log archive attempt $attempt failed with HTTP $code"
+            echo "::warning::build log archive attempt $attempt failed for run $RUN_ID with HTTP $code"
+            if [ -s /tmp/unzip-test.log ]; then
+              cat /tmp/unzip-test.log >&2
+            fi
             if [ $attempt -lt 6 ]; then
               sleep 10
             fi
           done
-          echo "text_ok=$TEXT_OK" >> "$GITHUB_OUTPUT"
           echo "archive_ok=$ARCHIVE_OK" >> "$GITHUB_OUTPUT"
 
       - name: Read run status
@@ -217,8 +204,8 @@ jobs:
           STATUS: ${{ steps.status.outputs.status }}
           RUNTIME: ${{ steps.status.outputs.runtime }}
           ZIP: ${{ steps.meta.outputs.zip }}
-          LOG: ${{ steps.meta.outputs.log }}
           LOG_ARCHIVE: ${{ steps.meta.outputs.log_archive }}
+          RUN_URL: ${{ github.server_url }}/${{ inputs.repo }}/actions/runs/${{ inputs.run_id }}
         run: |
           python3 release.py publish --deferred \
             --metadata-file build-output/metadata.json \
@@ -230,8 +217,8 @@ jobs:
             --status "$STATUS" \
             --runtime "$RUNTIME" \
             --zip "$ZIP" \
-            --log "$LOG" \
-            --log-archive "$LOG_ARCHIVE"
+            --log-archive "$LOG_ARCHIVE" \
+            --run-url "$RUN_URL"
 
       - name: Write release summary
         id: summary
@@ -240,16 +227,14 @@ jobs:
           RELEASE_OK: ${{ steps.publish.outputs.release_ok }}
           TELEGRAM_OK: ${{ steps.publish.outputs.telegram_ok }}
           TELEGRAM_DESCRIPTION: ${{ steps.publish.outputs.telegram_description }}
-          TEXT_OK: ${{ steps.logs.outputs.text_ok }}
           ARCHIVE_OK: ${{ steps.logs.outputs.archive_ok }}
           TARGET_REPO: ${{ inputs.repo }}
           RUN_ID: ${{ inputs.run_id }}
           ZIP: ${{ steps.meta.outputs.zip }}
-          LOG: ${{ steps.meta.outputs.log }}
           LOG_ARCHIVE: ${{ steps.meta.outputs.log_archive }}
         run: |
           ok=false
-          if [ "$RELEASE_OK" = "true" ] && [ "$TELEGRAM_OK" = "true" ]; then
+          if [ "$RELEASE_OK" = "true" ] && [ "$TELEGRAM_OK" = "true" ] && [ "$ARCHIVE_OK" = "true" ]; then
             ok=true
           fi
           {
@@ -260,27 +245,18 @@ jobs:
             if [ -n "$TELEGRAM_DESCRIPTION" ]; then
               echo "  - Telegram description: $TELEGRAM_DESCRIPTION"
             fi
-            echo "- Files sent:"
-            if [ -n "$ZIP" ] && [ -f "$ZIP" ]; then
-              echo "  - module zip: $ZIP"
+            echo "- Files released:"
+            if [ "$RELEASE_OK" = "true" ] && [ -n "$ZIP" ] && [ -f "$ZIP" ]; then
+              echo "  - module zip: $(basename "$ZIP")"
             else
-              echo "  - module zip: not sent"
+              echo "  - module zip: not released"
             fi
-            if [ -n "$LOG" ] && [ -f "$LOG" ]; then
-              echo "  - build log: $LOG"
+            if [ "$RELEASE_OK" = "true" ] && [ -n "$LOG_ARCHIVE" ] && [ -f "$LOG_ARCHIVE" ]; then
+              echo "  - log archive: $(basename "$LOG_ARCHIVE")"
             else
-              echo "  - build log: not sent"
-            fi
-            if [ -n "$LOG_ARCHIVE" ] && [ -f "$LOG_ARCHIVE" ]; then
-              echo "  - log archive: $LOG_ARCHIVE"
-            else
-              echo "  - log archive: not sent"
+              echo "  - log archive: not released"
             fi
             gap=false
-            if [ "$TEXT_OK" != "true" ]; then
-              echo "- Gap: build log text was not fetched completely"
-              gap=true
-            fi
             if [ "$ARCHIVE_OK" != "true" ]; then
               echo "- Gap: build log archive was not fetched completely"
               gap=true
@@ -288,7 +264,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "ok=$ok" >> "$GITHUB_OUTPUT"
           if [ "$gap" = "true" ]; then
-            echo "::error::build log fetch incomplete"
+            echo "::error::build log archive fetch incomplete"
             exit 1
           fi
 

@@ -310,17 +310,20 @@ def telegram_request(cmd, label):
         description = f"invalid Telegram response: {exc}"
     if not ok:
         print(f"{label} failed: {redact_command(cmd)}", file=sys.stderr)
+        print(f"::warning::{label} description: {description or 'no description'}")
         print(f"{label} description: {description or 'no description'}", file=sys.stderr)
     return ok, description
 
 
-def telegram_send_message(bot_token, chat_id, text):
+def telegram_send_message(bot_token, chat_id, text, keyboard=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if keyboard:
+        payload["reply_markup"] = keyboard
     cmd = [
         "curl", "-sS", "-X", "POST",
         "-H", "Content-Type: application/json",
@@ -330,15 +333,17 @@ def telegram_send_message(bot_token, chat_id, text):
     return telegram_request(cmd, "sendMessage")
 
 
-def telegram_send_document(bot_token, chat_id, path, caption):
+def telegram_send_document(bot_token, chat_id, path, caption, keyboard=None):
     cmd = [
         "curl", "-sS", "-X", "POST",
         "--form-string", f"chat_id={chat_id}",
         "-F", f"document=@{path}",
         "--form-string", f"caption={caption}",
         "--form-string", "parse_mode=HTML",
-        f"https://api.telegram.org/bot{bot_token}/sendDocument",
     ]
+    if keyboard:
+        cmd += ["--form-string", f"reply_markup={json.dumps(keyboard)}"]
+    cmd += [f"https://api.telegram.org/bot{bot_token}/sendDocument"]
     return telegram_request(cmd, "sendDocument")
 
 
@@ -380,6 +385,48 @@ def button_links(args, repo_url, tag):
     return " ".join(links)
 
 
+def build_deferred_buttons(args, repo_url, tag, meta, log_archive_name, run_url):
+    logs_url = ""
+    if log_archive_name and args.log_archive and os.path.isfile(args.log_archive):
+        logs_url = f"{repo_url}/releases/download/{tag}/{log_archive_name}"
+    else:
+        logs_url = run_url or ""
+    logs_button = {"text": "Logs 📋", "url": logs_url}
+
+    keyboard = {}
+    try:
+        if args.buttons_file and os.path.exists(args.buttons_file):
+            with open(args.buttons_file) as handle:
+                keyboard = json.load(handle) or {}
+        elif args.buttons:
+            keyboard = json.loads(args.buttons) or {}
+    except Exception as exc:
+        print(f"button parsing failed: {exc}", file=sys.stderr)
+
+    rows = keyboard.get("inline_keyboard") or []
+    if not rows:
+        commit_hash = str(meta.get("commit_hash") or "")
+        commit_url = f"{repo_url}/commit/{commit_hash}"
+        rows = [
+            [
+                {"text": "Release 📦", "url": f"{repo_url}/releases/tag/{tag}"},
+                logs_button,
+            ],
+            [
+                {"text": "Commit 🔗", "url": commit_url},
+                {"text": "Repo 🏠", "url": repo_url},
+            ],
+        ]
+    else:
+        rows = list(rows)
+        rows.append([logs_button])
+    return {"inline_keyboard": rows}
+
+
+def join_description(note, detail):
+    return " ".join(part for part in (note, detail) if part)
+
+
 def cmd_publish_deferred(args):
     if not args.metadata_file or not os.path.isfile(args.metadata_file):
         print(f"deferred publish: metadata file not found: {args.metadata_file}", file=sys.stderr)
@@ -402,7 +449,7 @@ def cmd_publish_deferred(args):
         display_name = "module"
 
     release_files = []
-    for path in (args.zip, args.log, args.log_archive):
+    for path in (args.zip, args.log_archive):
         if path and os.path.isfile(path):
             release_files.append(path)
     for path in release_files:
@@ -465,7 +512,10 @@ def cmd_publish_deferred(args):
         if attempt < 3:
             time.sleep(5)
     if not release_ok:
-        print("deferred publish: release creation failed after 3 attempts", file=sys.stderr)
+        gh_output("release_ok", "false")
+        gh_output("telegram_ok", "false")
+        gh_output("telegram_description", "release creation failed after 3 attempts")
+        sys.exit(1)
 
     expected_assets = []
     if release_ok:
@@ -513,84 +563,60 @@ def cmd_publish_deferred(args):
         print(f"deferred publish: {telegram_description}", file=sys.stderr)
     else:
         repo_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{args.source_repo}"
-        links = button_links(args, repo_url, tag)
-        telegram_files = []
+        log_archive_name = ""
+        if args.log_archive and os.path.isfile(args.log_archive):
+            log_archive_name = os.path.basename(args.log_archive)
+        keyboard = build_deferred_buttons(
+            args, repo_url, tag, meta, log_archive_name, args.run_url,
+        )
+        zip_path = ""
         if args.status == "success" and args.zip and os.path.isfile(args.zip):
-            telegram_files.append(args.zip)
-        for path in (args.log, args.log_archive):
-            if path and os.path.isfile(path):
-                telegram_files.append(path)
+            zip_path = args.zip
 
-        oversized = []
-        accepted = []
-        for path in telegram_files:
-            if os.path.getsize(path) > TELEGRAM_FILE_LIMIT:
-                oversized.append(os.path.basename(path))
-            else:
-                accepted.append(path)
+        oversized_note = ""
+        if zip_path and os.path.getsize(zip_path) > TELEGRAM_FILE_LIMIT:
+            oversized_note = "Module zip omitted from Telegram: exceeds 49 MB Bot API limit"
+            zip_path = ""
 
         description = caption.rstrip()
-        if oversized:
-            description += "\nOversized file omitted: " + ", ".join(html_escape(name) for name in oversized)
-        full_caption = description + ("\n" + links if links else "")
-        short_caption = links if links else "Release details are in the job summary"
+        if oversized_note:
+            description += "\n" + oversized_note
+        short_caption = (
+            f"{html_escape(build_label(args.tag))}\n"
+            f"Version: {html_escape(args.version or 'n/a')}"
+        )
+        long_description = len(description) > 1024
 
-        if len(full_caption) > 1024:
-            sent, detail = telegram_send_message(bot_token, chat_id, description)
-            if sent:
-                telegram_ok = True
-                telegram_description = detail
+        if long_description:
+            first_ok, first_detail = telegram_send_message(bot_token, chat_id, description)
+            if zip_path:
+                second_ok, second_detail = telegram_send_document(
+                    bot_token, chat_id, zip_path, short_caption, keyboard,
+                )
+                if not second_ok:
+                    second_ok, second_detail = telegram_send_message(
+                        bot_token, chat_id, short_caption, keyboard,
+                    )
             else:
-                telegram_description = detail
-
-        if len(accepted) > 1:
-            sent, detail = telegram_send_album(bot_token, chat_id, accepted, short_caption if len(full_caption) > 1024 else full_caption)
-            if sent:
-                telegram_ok = True
-                telegram_description = detail
-            else:
-                telegram_description = detail
-                zip_path = args.zip if args.status == "success" and args.zip in accepted else ""
-                if zip_path:
-                    sent, detail = telegram_send_document(bot_token, chat_id, zip_path, short_caption if len(full_caption) > 1024 else full_caption)
-                    if sent:
-                        telegram_ok = True
-                        telegram_description = detail
-                    else:
-                        telegram_description = detail
-                if not telegram_ok:
-                    sent, detail = telegram_send_message(bot_token, chat_id, short_caption)
-                    if sent:
-                        telegram_ok = True
-                        telegram_description = detail
-                    else:
-                        telegram_description = detail
-        elif len(accepted) == 1:
-            sent, detail = telegram_send_document(
-                bot_token, chat_id, accepted[0],
-                short_caption if len(full_caption) > 1024 else full_caption,
+                second_ok, second_detail = telegram_send_message(
+                    bot_token, chat_id, short_caption, keyboard,
+                )
+            telegram_ok = first_ok and second_ok
+            telegram_description = join_description(oversized_note, second_detail or first_detail)
+        elif zip_path:
+            telegram_ok, detail = telegram_send_document(
+                bot_token, chat_id, zip_path, description, keyboard,
             )
-            if sent:
-                telegram_ok = True
-                telegram_description = detail
-            else:
-                telegram_description = detail
-                sent, detail = telegram_send_message(bot_token, chat_id, short_caption)
-                if sent:
-                    telegram_ok = True
-                    telegram_description = detail
-                else:
-                    telegram_description = detail
+            if not telegram_ok:
+                telegram_ok, detail = telegram_send_message(
+                    bot_token, chat_id, description, keyboard,
+                )
+            telegram_description = join_description(oversized_note, detail)
         else:
-            sent, detail = telegram_send_message(
-                bot_token, chat_id,
-                description if len(description) <= 1024 else short_caption,
+            telegram_ok, detail = telegram_send_message(
+                bot_token, chat_id, description, keyboard,
             )
-            if sent:
-                telegram_ok = True
-                telegram_description = detail
-            else:
-                telegram_description = detail
+            telegram_description = join_description(oversized_note, detail)
 
     gh_output("release_ok", "true" if release_ok else "false")
     gh_output("telegram_ok", "true" if telegram_ok else "false")
@@ -723,6 +749,7 @@ def main():
     p_pub.add_argument("--log", default="")
     p_pub.add_argument("--log-archive", default="")
     p_pub.add_argument("--runtime", default="")
+    p_pub.add_argument("--run-url", default="")
     p_pub.set_defaults(func=cmd_publish)
 
     args = parser.parse_args()
