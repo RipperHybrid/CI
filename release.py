@@ -249,15 +249,22 @@ def redact_command(cmd):
 
 
 def run_report(cmd, label):
+    telegram = any("api.telegram.org/bot" in str(part) for part in cmd)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
     except Exception as exc:
-        print(f"{label} raised: {exc}", file=sys.stderr)
+        if telegram:
+            print(label, file=sys.stderr)
+        else:
+            print(f"{label} raised: {exc}", file=sys.stderr)
         return subprocess.CompletedProcess(cmd, 1, "", str(exc))
     if result.returncode != 0:
-        print(f"{label} failed: {redact_command(cmd)}", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr.strip(), file=sys.stderr)
+        if telegram:
+            print(label, file=sys.stderr)
+        else:
+            print(f"{label} failed: {redact_command(cmd)}", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr.strip(), file=sys.stderr)
     return result
 
 
@@ -298,20 +305,29 @@ def inspect_release(tag, source_repo):
 def telegram_request(cmd, label):
     result = run_report(cmd, label)
     response = (result.stdout or "").strip()
-    if response:
-        print(response)
     description = ""
+    error_code = ""
     try:
-        data = json.loads(response or "{}")
+        data = json.loads(response)
         ok = data.get("ok") is True
         description = str(data.get("description") or "")
+        error_code = str(data.get("error_code") or "")
     except Exception as exc:
         ok = False
         description = f"invalid Telegram response: {exc}"
-    if not ok:
-        print(f"{label} failed: {redact_command(cmd)}", file=sys.stderr)
+        redacted = response
+        for secret in (os.environ.get("BOT_TOKEN", ""), os.environ.get("CHAT_ID", "")):
+            if secret:
+                redacted = redacted.replace(secret, "<redacted>")
+        preview = redacted[:120].replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+        print(f"{label} invalid response length: {len(response)}", file=sys.stderr)
+        print(f"{label} invalid response preview: {preview}", file=sys.stderr)
+    if ok:
+        print(f"{label} ok")
+    else:
+        print(f"{label} exit code: {result.returncode}", file=sys.stderr)
+        print(f"{label} error_code: {error_code or 'n/a'}", file=sys.stderr)
         print(f"::warning::{label} description: {description or 'no description'}")
-        print(f"{label} description: {description or 'no description'}", file=sys.stderr)
     return ok, description
 
 
